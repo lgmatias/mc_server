@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Archive the Minecraft world from the EBS data volume of a running server
-# and upload it to the shared S3 bucket.
+# Archive the Minecraft world from the EBS data volume of a server stack
+# and upload it to the shared S3 bucket. Works whether the instance is
+# currently running or stopped — a stopped instance is started temporarily
+# for the backup and stopped again afterwards.
 #
-# The server is briefly stopped during the archive to ensure a consistent snapshot,
-# then restarted automatically. Backups land at:
+# Backups land at:
 #   s3://mc-worlds-<account>-<region>/<version>/worlds-YYYYMMDDTHHMMSSZ.tar.gz
 #
 # Prerequisites:
 #   - deploy-worlds-bucket.sh has been run (creates the bucket)
-#   - The target server stack has been deployed and the instance is running
+#   - The target server stack has been deployed
 #
 # Usage: ./backup-world.sh <minecraft-version|pgm> [region]
 #
@@ -48,13 +49,49 @@ if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
   exit 1
 fi
 
-STATE=$(aws ec2 describe-instances \
+ORIGINAL_STATE=$(aws ec2 describe-instances \
   --region "$REGION" --instance-ids "$INSTANCE_ID" \
   --query 'Reservations[0].Instances[0].State.Name' --output text)
-if [ "$STATE" != "running" ]; then
-  echo "Error: instance is '$STATE'. Start it first:" >&2
-  echo "  ./scripts/server-start.sh $TARGET $REGION" >&2
-  exit 1
+
+WAS_STOPPED=false
+case "$ORIGINAL_STATE" in
+  running)
+    ;;
+  stopped)
+    WAS_STOPPED=true
+    echo "Instance is stopped — starting it temporarily for the backup..."
+    aws ec2 start-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+      --output text --query 'StartingInstances[0].CurrentState.Name' >/dev/null
+    aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+    echo -n "Waiting for SSM agent to come online"
+    PING=""
+    for i in $(seq 1 60); do
+      PING=$(aws ssm describe-instance-information \
+        --region "$REGION" \
+        --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+        --query 'InstanceInformationList[0].PingStatus' \
+        --output text 2>/dev/null || echo "")
+      if [ "$PING" = "Online" ]; then echo " ready."; break; fi
+      echo -n "."
+      sleep 5
+    done
+    if [ "$PING" != "Online" ]; then
+      echo ""
+      echo "Error: SSM agent did not come online within 5 minutes." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Error: instance is '$ORIGINAL_STATE' (need 'running' or 'stopped')." >&2
+    exit 1
+    ;;
+esac
+
+# If we started the instance ourselves, leave Minecraft stopped after backup —
+# we are going to stop the instance again anyway.
+RESTART_MC=true
+if [ "$WAS_STOPPED" = "true" ]; then
+  RESTART_MC=false
 fi
 
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -79,15 +116,17 @@ tar czf /tmp/worlds.tar.gz $TARGETS
 echo "Uploading to s3://__BUCKET__/__KEY__"
 aws --region __REGION__ s3 cp /tmp/worlds.tar.gz s3://__BUCKET__/__KEY__
 rm -f /tmp/worlds.tar.gz
-systemctl start minecraft
+if [ "__RESTART_MC__" = "true" ]; then
+  systemctl start minecraft
+fi
 echo "Backup complete."
 REMOTE
 )
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__BUCKET__/$BUCKET}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__KEY__/$S3_KEY}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__REGION__/$REGION}"
+REMOTE_SCRIPT="${REMOTE_SCRIPT//__RESTART_MC__/$RESTART_MC}"
 
-# Base64 the whole script so SSM gets one cleanly-quoted command line
 SCRIPT_B64=$(printf '%s' "$REMOTE_SCRIPT" | base64 | tr -d '\n')
 
 echo "Sending backup command to $INSTANCE_ID..."
@@ -124,10 +163,22 @@ while true; do
         --command-id "$COMMAND_ID" \
         --instance-id "$INSTANCE_ID" \
         --query 'StandardErrorContent' --output text >&2
+      if [ "$WAS_STOPPED" = "true" ]; then
+        echo "Stopping instance again..." >&2
+        aws ec2 stop-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+          --output text --query 'StoppingInstances[0].CurrentState.Name' >/dev/null || true
+      fi
       exit 1
       ;;
   esac
 done
+
+if [ "$WAS_STOPPED" = "true" ]; then
+  echo ""
+  echo "Stopping instance again (it was stopped before the backup)..."
+  aws ec2 stop-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --output text --query 'StoppingInstances[0].CurrentState.Name' >/dev/null
+fi
 
 echo ""
 echo "Backup uploaded:"
