@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Shared S3 bucket for Minecraft world backups. All server stacks write to this
+  bucket under a per-version prefix (e.g. 1.20.4/worlds-YYYYMMDDTHHMMSSZ.tar.gz).
+  The bucket name pattern is mc-worlds-<account-id>-<region> so it is globally unique
+  and the server stack IAM policies can reference it by ARN without import dependencies.
+
+Resources:
+  WorldsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'mc-worlds-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: minecraft-world-backups
+
+Outputs:
+  BucketName:
+    Description: S3 bucket holding world backups
+    Value: !Ref WorldsBucket
+  BucketArn:
+    Description: Bucket ARN
+    Value: !GetAtt WorldsBucket.Arn
+  ListCommand:
+    Description: List all stored backups
+    Value: !Sub 'aws s3 ls s3://${WorldsBucket}/ --recursive'

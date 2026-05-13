@@ -54,6 +54,7 @@ Resources:
           Value: !Sub '${AWS::StackName}-sg'
 
   # IAM role allowing the instance to be managed via Systems Manager Session Manager
+  # and to upload world backups to the shared mc-worlds-<account>-<region> bucket.
   SsmRole:
     Type: AWS::IAM::Role
     Properties:
@@ -66,6 +67,19 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: WorldsBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::mc-worlds-${AWS::AccountId}-${AWS::Region}'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::mc-worlds-${AWS::AccountId}-${AWS::Region}/*'
 
   SsmInstanceProfile:
     Type: AWS::IAM::InstanceProfile
