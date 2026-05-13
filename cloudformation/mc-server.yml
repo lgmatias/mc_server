@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Vanilla Minecraft Java Edition server on EC2.
+  Supports any released version. The root EBS volume has DeleteOnTermination=false
+  so world data survives instance termination — delete the volume manually when no longer needed.
+
+Parameters:
+  MinecraftVersion:
+    Type: String
+    Default: '1.20.4'
+    Description: >
+      Minecraft server version (e.g. 1.20.4, 1.19.4, 1.16.5, 1.8.9).
+      Java is selected automatically: <1.17 → Java 8, 1.17-1.20.4 → Java 17, ≥1.20.5 → Java 21.
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
+    Description: t3.medium (2 vCPU / 4 GB) works well for up to ~10 players.
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair name for SSH access.
+
+  ServerMemoryMB:
+    Type: Number
+    Default: 2048
+    MinValue: 512
+    MaxValue: 14336
+    Description: JVM heap size in MB. Leave ~1 GB for the OS (e.g. t3.medium → 3072 max).
+
+  VolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 10
+    MaxValue: 500
+    Description: Root EBS volume size in GB. World data grows over time; 20 GB is fine to start.
+
+  AllowedCIDR:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR block allowed to reach port 25565 and SSH. Restrict to your IP for security.
+
+Resources:
+  MinecraftSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Minecraft server — SSH + game port
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+        - IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+          CidrIp: !Ref AllowedCIDR
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sg'
+
+  MinecraftServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      # Latest Amazon Linux 2 AMI resolved at deploy time
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      SecurityGroups:
+        - !Ref MinecraftSG
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/mc-setup.log 2>&1
+
+          MC_VERSION="${MinecraftVersion}"
+
+          # Determine required Java version from the minor version number.
+          # CF substitutes ${MinecraftVersion}; bash vars use no braces to avoid CF conflicts.
+          MINOR=$(echo "$MC_VERSION" | cut -d. -f2)
+          PATCH_RAW=$(echo "$MC_VERSION" | cut -d. -f3)
+          if [ -z "$PATCH_RAW" ]; then PATCH=0; else PATCH=$PATCH_RAW; fi
+
+          if [ "$MINOR" -ge 20 ] && [ "$PATCH" -ge 5 ]; then
+            JAVA_PKG="java-21-amazon-corretto-headless"
+          elif [ "$MINOR" -ge 17 ]; then
+            JAVA_PKG="java-17-amazon-corretto-headless"
+          else
+            JAVA_PKG="java-1.8.0-amazon-corretto-headless"
+          fi
+
+          # Add Amazon Corretto repo (provides all Java versions on AL2)
+          rpm --import https://yum.corretto.aws/corretto.key
+          curl -fsSL https://yum.corretto.aws/corretto.repo -o /etc/yum.repos.d/corretto.repo
+          yum install -y $JAVA_PKG python3 curl
+
+          # Dedicated unprivileged user for the server process
+          useradd -r -m -d /opt/minecraft minecraft
+
+          # Resolve server jar URL from Mojang's version manifest API
+          curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json \
+            -o /tmp/manifest.json
+
+          VERSION_URL=$(python3 - "$MC_VERSION" << 'PYEOF'
+          import json, sys
+          mc_ver = sys.argv[1]
+          with open('/tmp/manifest.json') as f:
+              data = json.load(f)
+          matches = [v['url'] for v in data['versions'] if v['id'] == mc_ver]
+          if not matches:
+              sys.exit('Version ' + mc_ver + ' not found in Mojang manifest')
+          print(matches[0])
+          PYEOF
+          )
+
+          curl -fsSL "$VERSION_URL" -o /tmp/version.json
+          SERVER_URL=$(python3 - << 'PYEOF'
+          import json
+          with open('/tmp/version.json') as f:
+              data = json.load(f)
+          print(data['downloads']['server']['url'])
+          PYEOF
+          )
+
+          curl -fsSL "$SERVER_URL" -o /opt/minecraft/server.jar
+          echo "eula=true" > /opt/minecraft/eula.txt
+
+          cat > /opt/minecraft/server.properties << 'PROPEOF'
+          server-port=25565
+          online-mode=true
+          max-players=20
+          motd=Minecraft Server
+          view-distance=10
+          PROPEOF
+
+          chown -R minecraft:minecraft /opt/minecraft
+
+          # Systemd service — ${ServerMemoryMB} is replaced by CF at deploy time
+          cat > /etc/systemd/system/minecraft.service << 'SVCEOF'
+          [Unit]
+          Description=Minecraft Server
+          After=network.target
+
+          [Service]
+          User=minecraft
+          WorkingDirectory=/opt/minecraft
+          ExecStart=/usr/bin/java -Xmx${ServerMemoryMB}M -Xms${ServerMemoryMB}M -jar server.jar nogui
+          ExecStop=/bin/kill -SIGTERM $MAINPID
+          Restart=on-failure
+          RestartSec=30
+          TimeoutStopSec=60
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          systemctl daemon-reload
+          systemctl enable minecraft
+          systemctl start minecraft
+
+Outputs:
+  PublicIP:
+    Description: Server public IP — connect clients to this address on port 25565
+    Value: !GetAtt MinecraftServer.PublicIp
+  InstanceId:
+    Description: EC2 instance ID — pass to server-start.sh / server-stop.sh
+    Value: !Ref MinecraftServer
+  SSHAccess:
+    Description: SSH connection string
+    Value: !Sub 'ec2-user@${MinecraftServer.PublicIp}'

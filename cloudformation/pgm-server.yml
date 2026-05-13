@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Minecraft 1.8.9 server running PGM (PvP Game Manager).
+  Uses SportPaper (the server jar bundled with PGM v0.15) and Java 8.
+  Place your map folders (each containing a map.xml) under /opt/minecraft/maps/ after launch.
+  The root EBS volume has DeleteOnTermination=false to preserve data on termination.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
+    Description: t3.medium (2 vCPU / 4 GB) handles most PGM match sizes comfortably.
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair name for SSH access.
+
+  ServerMemoryMB:
+    Type: Number
+    Default: 2048
+    MinValue: 512
+    MaxValue: 14336
+    Description: JVM heap size in MB.
+
+  VolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 10
+    MaxValue: 500
+    Description: Root EBS volume size in GB.
+
+  AllowedCIDR:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR block allowed to reach port 25565 and SSH.
+
+Resources:
+  PgmSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PGM server — SSH + game port
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+        - IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+          CidrIp: !Ref AllowedCIDR
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sg'
+
+  PgmServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      SecurityGroups:
+        - !Ref PgmSG
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/mc-pgm-setup.log 2>&1
+
+          # PGM v0.15 ships SportPaper.jar (server) and PGM.jar (plugin) together
+          PGM_RELEASE="v0.15"
+          BASE_URL="https://github.com/PGMDev/PGM/releases/download/$PGM_RELEASE"
+
+          # Add Amazon Corretto repo for Java 8
+          rpm --import https://yum.corretto.aws/corretto.key
+          curl -fsSL https://yum.corretto.aws/corretto.repo -o /etc/yum.repos.d/corretto.repo
+          yum install -y java-1.8.0-amazon-corretto-headless curl
+
+          useradd -r -m -d /opt/minecraft minecraft
+          mkdir -p /opt/minecraft/plugins/PGM /opt/minecraft/maps
+
+          # Server jar (SportPaper — a PvP-tuned 1.8.8 Paper fork)
+          curl -fsSL "$BASE_URL/SportPaper.jar" -o /opt/minecraft/server.jar
+
+          # PGM plugin
+          curl -fsSL "$BASE_URL/PGM.jar" -o /opt/minecraft/plugins/PGM.jar
+
+          echo "eula=true" > /opt/minecraft/eula.txt
+
+          cat > /opt/minecraft/server.properties << 'PROPEOF'
+          server-port=25565
+          online-mode=true
+          max-players=40
+          motd=PGM Server
+          view-distance=6
+          PROPEOF
+
+          # Minimal PGM config — maps are loaded from /opt/minecraft/maps/
+          cat > /opt/minecraft/plugins/PGM/config.yml << 'CFGEOF'
+          maps:
+            uri: ~
+            source: "file"
+            path: "/opt/minecraft/maps"
+          CFGEOF
+
+          # Placeholder map directory with instructions
+          mkdir -p /opt/minecraft/maps/example-map
+          cat > /opt/minecraft/maps/example-map/README.txt << 'RDEOF'
+          Place your PGM map folders here. Each map needs a map.xml file.
+          See https://pgm.dev/docs/map/ for the map XML specification.
+          RDEOF
+
+          chown -R minecraft:minecraft /opt/minecraft
+
+          # ${ServerMemoryMB} is replaced by CloudFormation at deploy time
+          cat > /etc/systemd/system/minecraft.service << 'SVCEOF'
+          [Unit]
+          Description=PGM Minecraft Server
+          After=network.target
+
+          [Service]
+          User=minecraft
+          WorkingDirectory=/opt/minecraft
+          ExecStart=/usr/bin/java -Xmx${ServerMemoryMB}M -Xms${ServerMemoryMB}M -jar server.jar nogui
+          ExecStop=/bin/kill -SIGTERM $MAINPID
+          Restart=on-failure
+          RestartSec=30
+          TimeoutStopSec=60
+
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+
+          systemctl daemon-reload
+          systemctl enable minecraft
+          systemctl start minecraft
+
+Outputs:
+  PublicIP:
+    Description: Server public IP — connect clients to this address on port 25565
+    Value: !GetAtt PgmServer.PublicIp
+  InstanceId:
+    Description: EC2 instance ID — pass to server-start.sh / server-stop.sh
+    Value: !Ref PgmServer
+  SSHAccess:
+    Description: SSH connection string
+    Value: !Sub 'ec2-user@${PgmServer.PublicIp}'
+  MapsPath:
+    Description: Upload PGM map folders to this path on the server
+    Value: /opt/minecraft/maps/
