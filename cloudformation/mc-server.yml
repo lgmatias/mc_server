@@ -53,7 +53,7 @@ Resources:
   MinecraftSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Minecraft server — game port only (admin access via SSM)
+      GroupDescription: Minecraft server - game port only (admin access via SSM)
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 25565
