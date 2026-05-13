@@ -232,6 +232,27 @@ Resources:
           PROPEOF
           fi
 
+          # First-boot world restore: if the data volume has no world yet but the
+          # shared S3 bucket has one for this version, pull it down. On instance
+          # replacement (volume preserved) this is a no-op since level.dat exists.
+          if [ ! -f /opt/minecraft/world/level.dat ]; then
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+            if [ -n "$ACCOUNT_ID" ]; then
+              BUCKET=mc-worlds-$ACCOUNT_ID
+              BUCKET_REGION=$(aws s3api get-bucket-location --bucket "$BUCKET" \
+                --query 'LocationConstraint' --output text 2>/dev/null || echo "")
+              if [ -z "$BUCKET_REGION" ] || [ "$BUCKET_REGION" = "None" ] || [ "$BUCKET_REGION" = "null" ]; then
+                BUCKET_REGION=us-east-1
+              fi
+              if aws --region "$BUCKET_REGION" s3 ls "s3://$BUCKET/$MC_VERSION/world.tar.gz" >/dev/null 2>&1; then
+                echo "Restoring world from s3://$BUCKET/$MC_VERSION/world.tar.gz..."
+                aws --region "$BUCKET_REGION" s3 cp "s3://$BUCKET/$MC_VERSION/world.tar.gz" /tmp/world.tar.gz
+                tar xzf /tmp/world.tar.gz -C /opt/minecraft/
+                rm -f /tmp/world.tar.gz
+              fi
+            fi
+          fi
+
           chown -R minecraft:minecraft /opt/minecraft
 
           cat > /etc/systemd/system/minecraft.service << 'SVCEOF'

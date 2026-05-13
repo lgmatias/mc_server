@@ -200,11 +200,22 @@ Resources:
           CFGEOF
           fi
 
-          if [ ! -f /opt/minecraft/maps/README.txt ]; then
-            cat > /opt/minecraft/maps/README.txt << 'RDEOF'
-          Place PGM map folders here. Each map needs a map.xml file.
-          See https://pgm.dev/docs/map/ for the map XML specification.
-          RDEOF
+          # Map sync: the S3 folder s3://<bucket>/pgm-maps/ is the source of
+          # truth — every map under that prefix is mirrored into
+          # /opt/minecraft/maps/ here, with --delete so removing a map from S3
+          # also removes it from the instance.
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+          if [ -n "$ACCOUNT_ID" ]; then
+            BUCKET=mc-worlds-$ACCOUNT_ID
+            if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+              BUCKET_REGION=$(aws s3api get-bucket-location --bucket "$BUCKET" \
+                --query 'LocationConstraint' --output text 2>/dev/null || echo "")
+              if [ -z "$BUCKET_REGION" ] || [ "$BUCKET_REGION" = "None" ] || [ "$BUCKET_REGION" = "null" ]; then
+                BUCKET_REGION=us-east-1
+              fi
+              echo "Syncing PGM maps from s3://$BUCKET/pgm-maps/ (S3 is the source of truth)..."
+              aws --region "$BUCKET_REGION" s3 sync "s3://$BUCKET/pgm-maps/" /opt/minecraft/maps/ --delete
+            fi
           fi
 
           chown -R minecraft:minecraft /opt/minecraft
