@@ -1,20 +1,16 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Minecraft 1.8.9 server running PGM (PvP Game Manager).
-  Uses SportPaper (the server jar bundled with PGM v0.15) and Java 8.
-  Place your map folders (each containing a map.xml) under /opt/minecraft/maps/ after launch.
-  The root EBS volume has DeleteOnTermination=false to preserve data on termination.
+  Minecraft 1.8.9 server running PGM (PvP Game Manager) on SportPaper.
+  World data and PGM maps live on a dedicated EBS volume (DeletionPolicy=Retain) so
+  changing the instance type terminates the old instance but preserves the volume.
+  Access via AWS Systems Manager Session Manager — no SSH key required.
 
 Parameters:
   InstanceType:
     Type: String
     Default: t3.medium
     AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
-    Description: t3.medium (2 vCPU / 4 GB) handles most PGM match sizes comfortably.
-
-  KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: EC2 key pair name for SSH access.
+    Description: Changing this replaces the instance; the data volume is preserved.
 
   ServerMemoryMB:
     Type: Number
@@ -28,23 +24,19 @@ Parameters:
     Default: 20
     MinValue: 10
     MaxValue: 500
-    Description: Root EBS volume size in GB.
+    Description: EBS data volume size in GB. Grows in place if increased.
 
   AllowedCIDR:
     Type: String
     Default: '0.0.0.0/0'
-    Description: CIDR block allowed to reach port 25565 and SSH.
+    Description: CIDR block allowed to reach the Minecraft game port (25565).
 
 Resources:
   PgmSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: PGM server — SSH + game port
+      GroupDescription: PGM server — game port only (admin access via SSM)
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: !Ref AllowedCIDR
         - IpProtocol: tcp
           FromPort: 25565
           ToPort: 25565
@@ -53,79 +45,145 @@ Resources:
         - Key: Name
           Value: !Sub '${AWS::StackName}-sg'
 
+  SsmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  SsmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref SsmRole
+
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: !Ref VolumeSize
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data'
+        - Key: MinecraftVersion
+          Value: '1.8.9-pgm'
+
   PgmServer:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: !Ref InstanceType
-      KeyName: !Ref KeyPairName
+      AvailabilityZone: !Select [0, !GetAZs '']
       ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      IamInstanceProfile: !Ref SsmInstanceProfile
       SecurityGroups:
         - !Ref PgmSG
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
-            VolumeSize: !Ref VolumeSize
+            VolumeSize: 8
             VolumeType: gp3
-            DeleteOnTermination: false
+            DeleteOnTermination: true
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}'
+        - Key: MinecraftVersion
+          Value: '1.8.9-pgm'
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -euo pipefail
           exec > /var/log/mc-pgm-setup.log 2>&1
 
-          # PGM v0.15 ships SportPaper.jar (server) and PGM.jar (plugin) together
           PGM_RELEASE="v0.15"
           BASE_URL="https://github.com/PGMDev/PGM/releases/download/$PGM_RELEASE"
 
-          # Add Amazon Corretto repo for Java 8
           rpm --import https://yum.corretto.aws/corretto.key
           curl -fsSL https://yum.corretto.aws/corretto.repo -o /etc/yum.repos.d/corretto.repo
           yum install -y java-1.8.0-amazon-corretto-headless curl
 
-          useradd -r -m -d /opt/minecraft minecraft
+          DEVICE=""
+          for i in $(seq 1 60); do
+            for dev in /dev/nvme1n1 /dev/xvdf /dev/sdf; do
+              if [ -b "$dev" ]; then DEVICE="$dev"; break 2; fi
+            done
+            sleep 2
+          done
+          if [ -z "$DEVICE" ]; then
+            echo "Data volume never appeared" >&2
+            exit 1
+          fi
+
+          if ! blkid "$DEVICE" >/dev/null 2>&1; then
+            mkfs.ext4 -L minecraft "$DEVICE"
+          fi
+
+          mkdir -p /opt/minecraft
+          if ! mountpoint -q /opt/minecraft; then
+            mount "$DEVICE" /opt/minecraft
+          fi
+
+          UUID=$(blkid -s UUID -o value "$DEVICE")
+          grep -q "^UUID=$UUID" /etc/fstab || \
+            echo "UUID=$UUID /opt/minecraft ext4 defaults,nofail 0 2" >> /etc/fstab
+
+          id minecraft &>/dev/null || \
+            useradd -r -d /opt/minecraft -s /sbin/nologin minecraft
+
           mkdir -p /opt/minecraft/plugins/PGM /opt/minecraft/maps
 
-          # Server jar (SportPaper — a PvP-tuned 1.8.8 Paper fork)
-          curl -fsSL "$BASE_URL/SportPaper.jar" -o /opt/minecraft/server.jar
+          # Only download jars on first deploy
+          if [ ! -f /opt/minecraft/server.jar ]; then
+            curl -fsSL "$BASE_URL/SportPaper.jar" -o /opt/minecraft/server.jar
+          fi
+          if [ ! -f /opt/minecraft/plugins/PGM.jar ]; then
+            curl -fsSL "$BASE_URL/PGM.jar" -o /opt/minecraft/plugins/PGM.jar
+          fi
 
-          # PGM plugin
-          curl -fsSL "$BASE_URL/PGM.jar" -o /opt/minecraft/plugins/PGM.jar
+          [ -f /opt/minecraft/eula.txt ] || echo "eula=true" > /opt/minecraft/eula.txt
 
-          echo "eula=true" > /opt/minecraft/eula.txt
-
-          cat > /opt/minecraft/server.properties << 'PROPEOF'
+          if [ ! -f /opt/minecraft/server.properties ]; then
+            cat > /opt/minecraft/server.properties << 'PROPEOF'
           server-port=25565
           online-mode=true
           max-players=40
           motd=PGM Server
           view-distance=6
           PROPEOF
+          fi
 
-          # Minimal PGM config — maps are loaded from /opt/minecraft/maps/
-          cat > /opt/minecraft/plugins/PGM/config.yml << 'CFGEOF'
+          if [ ! -f /opt/minecraft/plugins/PGM/config.yml ]; then
+            cat > /opt/minecraft/plugins/PGM/config.yml << 'CFGEOF'
           maps:
             uri: ~
             source: "file"
             path: "/opt/minecraft/maps"
           CFGEOF
+          fi
 
-          # Placeholder map directory with instructions
-          mkdir -p /opt/minecraft/maps/example-map
-          cat > /opt/minecraft/maps/example-map/README.txt << 'RDEOF'
-          Place your PGM map folders here. Each map needs a map.xml file.
+          if [ ! -f /opt/minecraft/maps/README.txt ]; then
+            cat > /opt/minecraft/maps/README.txt << 'RDEOF'
+          Place PGM map folders here. Each map needs a map.xml file.
           See https://pgm.dev/docs/map/ for the map XML specification.
           RDEOF
+          fi
 
           chown -R minecraft:minecraft /opt/minecraft
 
-          # ${ServerMemoryMB} is replaced by CloudFormation at deploy time
           cat > /etc/systemd/system/minecraft.service << 'SVCEOF'
           [Unit]
           Description=PGM Minecraft Server
-          After=network.target
+          After=network.target opt-minecraft.mount
+          Requires=opt-minecraft.mount
 
           [Service]
           User=minecraft
@@ -144,16 +202,29 @@ Resources:
           systemctl enable minecraft
           systemctl start minecraft
 
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref PgmServer
+      VolumeId: !Ref DataVolume
+
 Outputs:
   PublicIP:
-    Description: Server public IP — connect clients to this address on port 25565
+    Description: Connect Minecraft clients to this IP on port 25565
     Value: !GetAtt PgmServer.PublicIp
   InstanceId:
-    Description: EC2 instance ID — pass to server-start.sh / server-stop.sh
+    Description: EC2 instance ID
     Value: !Ref PgmServer
-  SSHAccess:
-    Description: SSH connection string
-    Value: !Sub 'ec2-user@${PgmServer.PublicIp}'
+  DataVolumeId:
+    Description: Persistent EBS volume holding maps and worlds (preserved on stack delete)
+    Value: !Ref DataVolume
+  SessionManagerConsole:
+    Description: Open Session Manager in the AWS Console (no SSH key needed)
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${PgmServer}?region=${AWS::Region}'
+  SessionManagerCLI:
+    Description: Open a shell from CloudShell or local AWS CLI
+    Value: !Sub 'aws ssm start-session --target ${PgmServer} --region ${AWS::Region}'
   MapsPath:
     Description: Upload PGM map folders to this path on the server
     Value: /opt/minecraft/maps/

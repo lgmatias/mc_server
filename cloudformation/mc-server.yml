@@ -1,8 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Vanilla Minecraft Java Edition server on EC2.
-  Supports any released version. The root EBS volume has DeleteOnTermination=false
-  so world data survives instance termination — delete the volume manually when no longer needed.
+  Vanilla Minecraft Java Edition server on EC2 — one stack per Minecraft version.
+  World data lives on a dedicated EBS volume (DeletionPolicy=Retain) so changing the
+  instance type terminates the old instance but preserves the volume. Access the
+  instance via AWS Systems Manager Session Manager (CloudShell or the EC2 console) —
+  no SSH key required.
 
 Parameters:
   MinecraftVersion:
@@ -16,41 +18,33 @@ Parameters:
     Type: String
     Default: t3.medium
     AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
-    Description: t3.medium (2 vCPU / 4 GB) works well for up to ~10 players.
-
-  KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: EC2 key pair name for SSH access.
+    Description: t3.medium (2 vCPU / 4 GB) handles ~10 players. Changing this replaces the instance; the data volume is preserved.
 
   ServerMemoryMB:
     Type: Number
     Default: 2048
     MinValue: 512
     MaxValue: 14336
-    Description: JVM heap size in MB. Leave ~1 GB for the OS (e.g. t3.medium → 3072 max).
+    Description: JVM heap size in MB. Leave ~1 GB for the OS.
 
   VolumeSize:
     Type: Number
     Default: 20
     MinValue: 10
     MaxValue: 500
-    Description: Root EBS volume size in GB. World data grows over time; 20 GB is fine to start.
+    Description: EBS data volume size in GB. Increasing this grows the volume in place; decreasing is not supported.
 
   AllowedCIDR:
     Type: String
     Default: '0.0.0.0/0'
-    Description: CIDR block allowed to reach port 25565 and SSH. Restrict to your IP for security.
+    Description: CIDR block allowed to reach the Minecraft game port (25565). Restrict for private servers.
 
 Resources:
   MinecraftSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Minecraft server — SSH + game port
+      GroupDescription: Minecraft server — game port only (admin access via SSM)
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: !Ref AllowedCIDR
         - IpProtocol: tcp
           FromPort: 25565
           ToPort: 25565
@@ -59,24 +53,61 @@ Resources:
         - Key: Name
           Value: !Sub '${AWS::StackName}-sg'
 
+  # IAM role allowing the instance to be managed via Systems Manager Session Manager
+  SsmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  SsmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref SsmRole
+
+  # Dedicated data volume — survives instance replacement and stack deletion
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Size: !Ref VolumeSize
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-data'
+        - Key: MinecraftVersion
+          Value: !Ref MinecraftVersion
+
   MinecraftServer:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: !Ref InstanceType
-      KeyName: !Ref KeyPairName
-      # Latest Amazon Linux 2 AMI resolved at deploy time
+      AvailabilityZone: !Select [0, !GetAZs '']
       ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      IamInstanceProfile: !Ref SsmInstanceProfile
       SecurityGroups:
         - !Ref MinecraftSG
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
-            VolumeSize: !Ref VolumeSize
+            VolumeSize: 8
             VolumeType: gp3
-            DeleteOnTermination: false
+            DeleteOnTermination: true
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}'
+        - Key: MinecraftVersion
+          Value: !Ref MinecraftVersion
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
@@ -85,8 +116,7 @@ Resources:
 
           MC_VERSION="${MinecraftVersion}"
 
-          # Determine required Java version from the minor version number.
-          # CF substitutes ${MinecraftVersion}; bash vars use no braces to avoid CF conflicts.
+          # Determine required Java version from minor.patch
           MINOR=$(echo "$MC_VERSION" | cut -d. -f2)
           PATCH_RAW=$(echo "$MC_VERSION" | cut -d. -f3)
           if [ -z "$PATCH_RAW" ]; then PATCH=0; else PATCH=$PATCH_RAW; fi
@@ -99,19 +129,46 @@ Resources:
             JAVA_PKG="java-1.8.0-amazon-corretto-headless"
           fi
 
-          # Add Amazon Corretto repo (provides all Java versions on AL2)
           rpm --import https://yum.corretto.aws/corretto.key
           curl -fsSL https://yum.corretto.aws/corretto.repo -o /etc/yum.repos.d/corretto.repo
           yum install -y $JAVA_PKG python3 curl
 
-          # Dedicated unprivileged user for the server process
-          useradd -r -m -d /opt/minecraft minecraft
+          # Wait for the data volume attachment to appear (Nitro: nvme1n1; legacy: xvdf/sdf)
+          DEVICE=""
+          for i in $(seq 1 60); do
+            for dev in /dev/nvme1n1 /dev/xvdf /dev/sdf; do
+              if [ -b "$dev" ]; then DEVICE="$dev"; break 2; fi
+            done
+            sleep 2
+          done
+          if [ -z "$DEVICE" ]; then
+            echo "Data volume never appeared" >&2
+            exit 1
+          fi
 
-          # Resolve server jar URL from Mojang's version manifest API
-          curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json \
-            -o /tmp/manifest.json
+          # Format only if the volume has no filesystem (first deploy)
+          if ! blkid "$DEVICE" >/dev/null 2>&1; then
+            mkfs.ext4 -L minecraft "$DEVICE"
+          fi
 
-          VERSION_URL=$(python3 - "$MC_VERSION" << 'PYEOF'
+          mkdir -p /opt/minecraft
+          if ! mountpoint -q /opt/minecraft; then
+            mount "$DEVICE" /opt/minecraft
+          fi
+
+          UUID=$(blkid -s UUID -o value "$DEVICE")
+          grep -q "^UUID=$UUID" /etc/fstab || \
+            echo "UUID=$UUID /opt/minecraft ext4 defaults,nofail 0 2" >> /etc/fstab
+
+          id minecraft &>/dev/null || \
+            useradd -r -d /opt/minecraft -s /sbin/nologin minecraft
+
+          # Only download the server jar on first deploy (volume was empty)
+          if [ ! -f /opt/minecraft/server.jar ]; then
+            curl -fsSL https://launchermeta.mojang.com/mc/game/version_manifest.json \
+              -o /tmp/manifest.json
+
+            VERSION_URL=$(python3 - "$MC_VERSION" << 'PYEOF'
           import json, sys
           mc_ver = sys.argv[1]
           with open('/tmp/manifest.json') as f:
@@ -122,34 +179,36 @@ Resources:
           print(matches[0])
           PYEOF
           )
-
-          curl -fsSL "$VERSION_URL" -o /tmp/version.json
-          SERVER_URL=$(python3 - << 'PYEOF'
+            curl -fsSL "$VERSION_URL" -o /tmp/version.json
+            SERVER_URL=$(python3 - << 'PYEOF'
           import json
           with open('/tmp/version.json') as f:
               data = json.load(f)
           print(data['downloads']['server']['url'])
           PYEOF
           )
+            curl -fsSL "$SERVER_URL" -o /opt/minecraft/server.jar
+          fi
 
-          curl -fsSL "$SERVER_URL" -o /opt/minecraft/server.jar
-          echo "eula=true" > /opt/minecraft/eula.txt
+          [ -f /opt/minecraft/eula.txt ] || echo "eula=true" > /opt/minecraft/eula.txt
 
-          cat > /opt/minecraft/server.properties << 'PROPEOF'
+          if [ ! -f /opt/minecraft/server.properties ]; then
+            cat > /opt/minecraft/server.properties << 'PROPEOF'
           server-port=25565
           online-mode=true
           max-players=20
           motd=Minecraft Server
           view-distance=10
           PROPEOF
+          fi
 
           chown -R minecraft:minecraft /opt/minecraft
 
-          # Systemd service — ${ServerMemoryMB} is replaced by CF at deploy time
           cat > /etc/systemd/system/minecraft.service << 'SVCEOF'
           [Unit]
           Description=Minecraft Server
-          After=network.target
+          After=network.target opt-minecraft.mount
+          Requires=opt-minecraft.mount
 
           [Service]
           User=minecraft
@@ -168,13 +227,26 @@ Resources:
           systemctl enable minecraft
           systemctl start minecraft
 
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref MinecraftServer
+      VolumeId: !Ref DataVolume
+
 Outputs:
   PublicIP:
-    Description: Server public IP — connect clients to this address on port 25565
+    Description: Connect Minecraft clients to this IP on port 25565
     Value: !GetAtt MinecraftServer.PublicIp
   InstanceId:
-    Description: EC2 instance ID — pass to server-start.sh / server-stop.sh
+    Description: EC2 instance ID
     Value: !Ref MinecraftServer
-  SSHAccess:
-    Description: SSH connection string
-    Value: !Sub 'ec2-user@${MinecraftServer.PublicIp}'
+  DataVolumeId:
+    Description: Persistent EBS volume holding the world (preserved on stack delete)
+    Value: !Ref DataVolume
+  SessionManagerConsole:
+    Description: Open Session Manager in the AWS Console (no SSH key needed)
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${MinecraftServer}?region=${AWS::Region}'
+  SessionManagerCLI:
+    Description: Open a shell from CloudShell or local AWS CLI
+    Value: !Sub 'aws ssm start-session --target ${MinecraftServer} --region ${AWS::Region}'
