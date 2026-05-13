@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Archive the Minecraft world from the EBS data volume of a server stack
-# and upload it to the shared S3 bucket. Works whether the instance is
-# currently running or stopped — a stopped instance is started temporarily
+# Archive the Minecraft world from the EBS data volume of a server stack and
+# upload it to the shared S3 bucket (mc-worlds-<account>). Works whether the
+# instance is running or stopped — a stopped instance is started temporarily
 # for the backup and stopped again afterwards.
 #
 # Backups land at:
-#   s3://mc-worlds-<account>-<region>/<version>/worlds-YYYYMMDDTHHMMSSZ.tar.gz
+#   s3://mc-worlds-<account>/<version>/worlds-YYYYMMDDTHHMMSSZ.tar.gz
 #
 # Prerequisites:
 #   - deploy-worlds-bucket.sh has been run (creates the bucket)
@@ -30,22 +30,29 @@ else
   S3_PREFIX="$TARGET"
 fi
 
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+BUCKET="mc-worlds-${ACCOUNT_ID}"
+
+# Discover where the bucket lives (us-east-1 returns null from get-bucket-location).
+BUCKET_REGION=$(aws s3api get-bucket-location --bucket "$BUCKET" \
+  --query 'LocationConstraint' --output text 2>/dev/null || echo "")
+if [ -z "$BUCKET_REGION" ] || [ "$BUCKET_REGION" = "None" ] || [ "$BUCKET_REGION" = "null" ]; then
+  # Either us-east-1 or the bucket doesn't exist — distinguish via head-bucket.
+  if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+    BUCKET_REGION="us-east-1"
+  else
+    echo "Error: bucket '$BUCKET' not found." >&2
+    echo "Deploy it first: ./scripts/deploy-worlds-bucket.sh [region]" >&2
+    exit 1
+  fi
+fi
+
 INSTANCE_ID=$(aws cloudformation describe-stacks \
   --region "$REGION" --stack-name "$STACK_NAME" \
   --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" \
   --output text 2>/dev/null || true)
 if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
   echo "Error: stack '$STACK_NAME' not found in $REGION." >&2
-  exit 1
-fi
-
-BUCKET=$(aws cloudformation describe-stacks \
-  --region "$REGION" --stack-name "mc-worlds-bucket" \
-  --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
-  --output text 2>/dev/null || true)
-if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
-  echo "Error: worlds bucket stack 'mc-worlds-bucket' not found in $REGION." >&2
-  echo "Deploy it first: ./scripts/deploy-worlds-bucket.sh $REGION" >&2
   exit 1
 fi
 
@@ -87,8 +94,6 @@ case "$ORIGINAL_STATE" in
     ;;
 esac
 
-# If we started the instance ourselves, leave Minecraft stopped after backup —
-# we are going to stop the instance again anyway.
 RESTART_MC=true
 if [ "$WAS_STOPPED" = "true" ]; then
   RESTART_MC=false
@@ -97,8 +102,6 @@ fi
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 S3_KEY="${S3_PREFIX}/worlds-${TIMESTAMP}.tar.gz"
 
-# Script that runs on the instance via SSM. Placeholders are substituted below;
-# bash variables inside use $TARGETS etc. which are expanded on the instance, not locally.
 REMOTE_SCRIPT=$(cat <<'REMOTE'
 set -euo pipefail
 cd /opt/minecraft
@@ -114,7 +117,7 @@ echo "Archiving:$TARGETS"
 systemctl stop minecraft || true
 tar czf /tmp/worlds.tar.gz $TARGETS
 echo "Uploading to s3://__BUCKET__/__KEY__"
-aws --region __REGION__ s3 cp /tmp/worlds.tar.gz s3://__BUCKET__/__KEY__
+aws --region __BUCKET_REGION__ s3 cp /tmp/worlds.tar.gz s3://__BUCKET__/__KEY__
 rm -f /tmp/worlds.tar.gz
 if [ "__RESTART_MC__" = "true" ]; then
   systemctl start minecraft
@@ -124,12 +127,12 @@ REMOTE
 )
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__BUCKET__/$BUCKET}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__KEY__/$S3_KEY}"
-REMOTE_SCRIPT="${REMOTE_SCRIPT//__REGION__/$REGION}"
+REMOTE_SCRIPT="${REMOTE_SCRIPT//__BUCKET_REGION__/$BUCKET_REGION}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__RESTART_MC__/$RESTART_MC}"
 
 SCRIPT_B64=$(printf '%s' "$REMOTE_SCRIPT" | base64 | tr -d '\n')
 
-echo "Sending backup command to $INSTANCE_ID..."
+echo "Sending backup command to $INSTANCE_ID (bucket in $BUCKET_REGION)..."
 COMMAND_ID=$(aws ssm send-command \
   --region "$REGION" \
   --instance-ids "$INSTANCE_ID" \
@@ -157,7 +160,6 @@ while true; do
     *)
       echo ""
       echo "Backup failed (status: $STATUS)." >&2
-      echo "stderr from the instance:" >&2
       aws ssm get-command-invocation \
         --region "$REGION" \
         --command-id "$COMMAND_ID" \
@@ -184,8 +186,8 @@ echo ""
 echo "Backup uploaded:"
 echo "  s3://${BUCKET}/${S3_KEY}"
 echo ""
-echo "Download locally with:"
-echo "  aws s3 cp s3://${BUCKET}/${S3_KEY} ./worlds-${TIMESTAMP}.tar.gz"
+echo "Download locally:"
+echo "  aws s3 cp s3://${BUCKET}/${S3_KEY} ./worlds-${TIMESTAMP}.tar.gz --region $BUCKET_REGION"
 echo ""
 echo "List all backups for this version:"
-echo "  aws s3 ls s3://${BUCKET}/${S3_PREFIX}/"
+echo "  aws s3 ls s3://${BUCKET}/${S3_PREFIX}/ --region $BUCKET_REGION"

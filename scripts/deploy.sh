@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Deploy or update a vanilla Minecraft server. One stack per Minecraft version.
-# The stack name is derived from the version (e.g. 1.20.4 -> mc-1-20-4) so re-deploying
-# the same version with a different instance size replaces the instance but reuses the
-# existing EBS data volume (the world is preserved).
+# Deploy or update a vanilla Minecraft server. One stack per Minecraft version
+# globally — if mc-X-Y-Z already exists in a different region, this script will
+# snapshot its EBS volume, copy the snapshot to the target region, deploy the new
+# stack there using the snapshot as the volume's seed, and then delete the old
+# stack and orphaned volume.
+#
+# The stack name is derived from the version (1.20.4 -> mc-1-20-4).
 #
 # Usage: ./deploy.sh <minecraft-version> [instance-type] [volume-size-gb] [region]
 #
 # Examples:
 #   ./deploy.sh 1.20.4
 #   ./deploy.sh 1.20.4 t3.large
-#   ./deploy.sh 1.16.5 t3.medium 30 us-west-2
+#   ./deploy.sh 1.16.5 t3.medium 30 us-west-2     # if this version already exists
+#                                                  # in another region, it is migrated
 
 set -euo pipefail
 
@@ -23,20 +27,41 @@ STACK_NAME="mc-$(echo "$MC_VERSION" | tr '.' '-')"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="$SCRIPT_DIR/../cloudformation/mc-server.yml"
 
-echo "Deploying Minecraft $MC_VERSION as stack '$STACK_NAME' in $REGION..."
+# shellcheck source=lib/migrate.sh
+source "$SCRIPT_DIR/lib/migrate.sh"
+
+echo "Target: Minecraft $MC_VERSION as stack '$STACK_NAME' in $REGION"
 echo "  Instance type: $INSTANCE_TYPE"
 echo "  Volume size:   ${VOLUME_SIZE} GB"
+echo ""
 
+prepare_migration_if_needed "$REGION" "$STACK_NAME"
+
+# Build parameter overrides
+PARAMS=("MinecraftVersion=$MC_VERSION" "InstanceType=$INSTANCE_TYPE")
+
+if [ -n "$MIGRATION_DEST_SNAPSHOT" ]; then
+  # When restoring from snapshot, volume size must be >= source. If user asked
+  # for less, bump it up so the deploy doesn't fail.
+  if [ -n "$MIGRATION_VOLUME_SIZE" ] && [ "$MIGRATION_VOLUME_SIZE" -gt "$VOLUME_SIZE" ]; then
+    echo "Note: increasing VolumeSize from $VOLUME_SIZE to $MIGRATION_VOLUME_SIZE GB (source volume size)."
+    VOLUME_SIZE="$MIGRATION_VOLUME_SIZE"
+  fi
+  PARAMS+=("VolumeSize=$VOLUME_SIZE" "SnapshotId=$MIGRATION_DEST_SNAPSHOT")
+else
+  PARAMS+=("VolumeSize=$VOLUME_SIZE")
+fi
+
+echo "Deploying stack..."
 aws cloudformation deploy \
   --region "$REGION" \
   --stack-name "$STACK_NAME" \
   --template-file "$TEMPLATE" \
   --capabilities CAPABILITY_IAM \
-  --parameter-overrides \
-    MinecraftVersion="$MC_VERSION" \
-    InstanceType="$INSTANCE_TYPE" \
-    VolumeSize="$VOLUME_SIZE" \
+  --parameter-overrides "${PARAMS[@]}" \
   --no-fail-on-empty-changeset
+
+finalize_migration_if_needed "$REGION"
 
 echo ""
 echo "Stack deployed. Server details:"
@@ -48,8 +73,4 @@ aws cloudformation describe-stacks \
 
 echo ""
 echo "First deploy: allow ~2 minutes for the server jar to download and start."
-echo "Re-deploys reuse the existing EBS volume and skip the download."
-echo ""
-echo "Open a shell on the instance via Session Manager (no SSH key needed):"
-echo "  - Browser: open the SessionManagerConsole URL above"
-echo "  - CloudShell or local CLI: run the SessionManagerCLI command above"
+echo "Connect to the instance via Session Manager — see the SessionManagerConsole URL above."

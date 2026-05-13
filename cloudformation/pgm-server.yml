@@ -31,6 +31,16 @@ Parameters:
     Default: '0.0.0.0/0'
     Description: CIDR block allowed to reach the Minecraft game port (25565).
 
+  SnapshotId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional EBS snapshot ID. If provided, the data volume is initialized from this snapshot
+      (used by deploy-pgm.sh during cross-region migration to carry maps/worlds across regions).
+
+Conditions:
+  HasSnapshot: !Not [!Equals [!Ref SnapshotId, '']]
+
 Resources:
   PgmSG:
     Type: AWS::EC2::SecurityGroup
@@ -66,12 +76,16 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: s3:ListBucket
-                Resource: !Sub 'arn:aws:s3:::mc-worlds-${AWS::AccountId}-${AWS::Region}'
+                Resource: !Sub 'arn:aws:s3:::mc-worlds-${AWS::AccountId}'
               - Effect: Allow
                 Action:
                   - s3:PutObject
                   - s3:GetObject
-                Resource: !Sub 'arn:aws:s3:::mc-worlds-${AWS::AccountId}-${AWS::Region}/*'
+                  - s3:GetBucketLocation
+                Resource: !Sub 'arn:aws:s3:::mc-worlds-${AWS::AccountId}/*'
+              - Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !Sub 'arn:aws:s3:::mc-worlds-${AWS::AccountId}'
 
   SsmInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -87,6 +101,7 @@ Resources:
       AvailabilityZone: !Select [0, !GetAZs '']
       Size: !Ref VolumeSize
       VolumeType: gp3
+      SnapshotId: !If [HasSnapshot, !Ref SnapshotId, !Ref AWS::NoValue]
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-data'

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Deploy the shared S3 bucket used by backup-world.sh.
-# Run this once per AWS region before deploying any server stacks. Idempotent.
+# Deploy the single shared S3 bucket used by backup-world.sh.
+# Run this once for your AWS account, in whichever region you want the bucket
+# to live in. The bucket name is mc-worlds-<account-id> (no region suffix), so
+# servers in any region can write to the same bucket.
 #
 # Usage: ./deploy-worlds-bucket.sh [region]
 
@@ -29,3 +31,4 @@ aws cloudformation describe-stacks \
 
 echo ""
 echo "Bucket has DeletionPolicy=Retain — deleting this stack will not delete backups."
+echo "Note: data uploads from EC2 in other regions cross AWS regions (~\$0.02/GB transfer cost)."
