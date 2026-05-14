@@ -1,10 +1,17 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Single shared S3 bucket for Minecraft world backups. All server stacks across
-  all regions write to this one bucket under a per-version prefix (e.g.
-  1.20.4/worlds-YYYYMMDDTHHMMSSZ.tar.gz). The bucket name is mc-worlds-<account>
-  (no region suffix) so server IAM policies in any region can reference the same
-  ARN. Deploy this stack once, in whichever region you want the bucket to live.
+  Single shared S3 bucket for Minecraft world data. All server stacks across all
+  regions write to this one bucket under a per-version prefix. Layout:
+    <version>/<dim>/...                              (canonical world, one top-
+      level prefix per dimension: world, world_nether, world_the_end. Overwritten
+      by server-stop.sh, restored by server-start.sh and first-boot.)
+    <version>/snapshots/<YYYYMMDDTHHMMSSZ>/<dir>/... (immutable point-in-time
+      snapshots from backup-world.sh)
+    pgm-maps/...                                     (PGM map source)
+  Worlds are stored as folders (incremental `aws s3 sync`), not tarballs. The
+  bucket name is mc-worlds-<account> (no region suffix) so server IAM policies
+  in any region can reference the same ARN. Deploy this stack once, in whichever
+  region you want the bucket to live.
 
 Resources:
   WorldsBucket:

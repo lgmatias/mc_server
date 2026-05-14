@@ -63,6 +63,31 @@ aws cloudformation deploy \
 
 finalize_migration_if_needed "$REGION"
 
+# Ensure the version's prefix exists in the worlds bucket. server-start.sh treats
+# S3 as the source of truth for world files; this marker makes the prefix
+# visible in the console and confirms the bucket is reachable from this region.
+# Non-fatal if the bucket doesn't exist yet — user can deploy it later.
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+WORLDS_BUCKET="mc-worlds-${ACCOUNT_ID}"
+WORLDS_BUCKET_REGION=$(aws s3api get-bucket-location --bucket "$WORLDS_BUCKET" \
+  --query 'LocationConstraint' --output text 2>/dev/null || echo "")
+if [ -z "$WORLDS_BUCKET_REGION" ] || [ "$WORLDS_BUCKET_REGION" = "None" ] || [ "$WORLDS_BUCKET_REGION" = "null" ]; then
+  if aws s3api head-bucket --bucket "$WORLDS_BUCKET" 2>/dev/null; then
+    WORLDS_BUCKET_REGION=us-east-1
+  else
+    WORLDS_BUCKET=""
+  fi
+fi
+if [ -n "$WORLDS_BUCKET" ]; then
+  if ! aws --region "$WORLDS_BUCKET_REGION" s3 ls "s3://$WORLDS_BUCKET/$MC_VERSION/" 2>/dev/null | grep -q .; then
+    echo "Creating s3://$WORLDS_BUCKET/$MC_VERSION/ marker..."
+    aws --region "$WORLDS_BUCKET_REGION" s3api put-object \
+      --bucket "$WORLDS_BUCKET" --key "${MC_VERSION}/" >/dev/null
+  fi
+else
+  echo "Note: worlds bucket 'mc-worlds-${ACCOUNT_ID}' not found — run ./scripts/deploy-worlds-bucket.sh to create it."
+fi
+
 echo ""
 echo "Stack deployed. Server details:"
 aws cloudformation describe-stacks \

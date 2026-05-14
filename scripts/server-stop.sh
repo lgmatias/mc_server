@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Stop the EC2 instance for a Minecraft server.
 #
-# For vanilla stacks (mc-X-Y-Z): before stopping, archive the world from the
-# data volume and upload it to s3://mc-worlds-<account>/<version>/world.tar.gz,
-# overwriting the previous one. This is the canonical world for that version.
-# server-start.sh will pull this back down on the next start.
+# For vanilla stacks (mc-X-Y-Z): before stopping, sync the world directories
+# from the data volume up to s3://mc-worlds-<account>/<version>/<dim>/ (one
+# top-level prefix per dimension: world, world_nether, world_the_end). This is
+# the canonical world for that version; --delete on the sync keeps S3 in
+# lockstep with the on-disk state. server-start.sh pulls this back down on the
+# next start. No tarball — incremental sync transfers only changed region files.
 #
 # For PGM: no world auto-save (PGM maps live in s3://.../pgm-maps/ and are
 # managed manually). The instance is just stopped.
@@ -59,7 +61,7 @@ if [ "$STATE" = "running" ] && [ "$IS_PGM" = "false" ]; then
   fi
 
   if [ -n "$BUCKET" ]; then
-    echo "Saving world to s3://$BUCKET/$TARGET/world.tar.gz..."
+    echo "Saving world to s3://$BUCKET/$TARGET/..."
 
     REMOTE_SCRIPT=$(cat <<'REMOTE'
 set -euo pipefail
@@ -72,12 +74,12 @@ if [ -z "$TARGETS" ]; then
   echo "No world directories on this instance — nothing to save."
   exit 0
 fi
-echo "Stopping minecraft and archiving:$TARGETS"
+echo "Stopping minecraft and syncing:$TARGETS"
 systemctl stop minecraft || true
-tar czf /tmp/world.tar.gz $TARGETS
-echo "Uploading to s3://__BUCKET__/__VERSION__/world.tar.gz"
-aws --region __BUCKET_REGION__ s3 cp /tmp/world.tar.gz s3://__BUCKET__/__VERSION__/world.tar.gz
-rm -f /tmp/world.tar.gz
+for d in $TARGETS; do
+  echo "Syncing $d -> s3://__BUCKET__/__VERSION__/$d/"
+  aws --region __BUCKET_REGION__ s3 sync "$d" "s3://__BUCKET__/__VERSION__/$d/" --delete
+done
 echo "Save complete."
 REMOTE
 )

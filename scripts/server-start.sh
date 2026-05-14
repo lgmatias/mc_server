@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Start the EC2 instance for a Minecraft server.
 #
-# For vanilla stacks (mc-X-Y-Z): after the instance is up, replace the local
-# world with s3://mc-worlds-<account>/<version>/world.tar.gz (if it exists),
-# then start the minecraft service. This is how you "load" a different world
-# — upload a new world.tar.gz to S3 and re-run this script.
+# For vanilla stacks (mc-X-Y-Z): world sync from S3 happens automatically on
+# the instance via the mc-pull-world.service systemd unit, which runs once at
+# boot before minecraft.service. This script just starts the instance — the
+# sync and Minecraft startup happen on the instance itself. To "load" a
+# different world, upload a new world tree to s3://mc-worlds-<account>/<version>/
+# and reboot the instance (or restart minecraft.service after restarting
+# mc-pull-world.service).
 #
 # For PGM: after the instance is up, sync s3://mc-worlds-<account>/pgm-maps/
-# into /opt/minecraft/maps/ (additive; does not delete local maps), then
-# start the minecraft service.
-#
-# If the worlds bucket doesn't exist yet (first deploy with no backup), the
-# instance just starts with whatever's on the data volume.
+# into /opt/minecraft/maps/ (additive; does not delete local maps) via SSM,
+# then start the minecraft service.
 #
 # Usage: ./server-start.sh <minecraft-version|pgm> [region]
 #
@@ -79,14 +79,15 @@ for i in $(seq 1 60); do
 done
 if [ "$PING" != "Online" ]; then
   echo ""
-  echo "Warning: SSM agent did not come online within 5 minutes — skipping S3 sync." >&2
-  BUCKET=""
+  echo "Warning: SSM agent did not come online within 5 minutes." >&2
 fi
 
-if [ -n "$BUCKET" ]; then
-  if [ "$IS_PGM" = "true" ]; then
-    echo "Mirroring PGM maps from s3://$BUCKET/pgm-maps/..."
-    REMOTE_SCRIPT=$(cat <<'REMOTE'
+# PGM still uses SSM-based remote sync for maps. Vanilla's world sync is now
+# handled on the instance by mc-pull-world.service (a oneshot systemd unit that
+# runs before minecraft.service on every boot) — nothing for us to do here.
+if [ "$IS_PGM" = "true" ] && [ -n "$BUCKET" ] && [ "$PING" = "Online" ]; then
+  echo "Mirroring PGM maps from s3://$BUCKET/pgm-maps/..."
+  REMOTE_SCRIPT=$(cat <<'REMOTE'
 set -euo pipefail
 systemctl stop minecraft || true
 mkdir -p /opt/minecraft/maps
@@ -97,31 +98,7 @@ systemctl start minecraft
 echo "Start complete."
 REMOTE
 )
-  else
-    echo "Loading world from s3://$BUCKET/$TARGET/world.tar.gz (if it exists)..."
-    REMOTE_SCRIPT=$(cat <<'REMOTE'
-set -euo pipefail
-cd /opt/minecraft
-systemctl stop minecraft || true
-if aws --region __BUCKET_REGION__ s3 ls s3://__BUCKET__/__VERSION__/world.tar.gz >/dev/null 2>&1; then
-  echo "Downloading world from S3..."
-  aws --region __BUCKET_REGION__ s3 cp s3://__BUCKET__/__VERSION__/world.tar.gz /tmp/world.tar.gz
-  rm -rf world world_nether world_the_end
-  tar xzf /tmp/world.tar.gz -C /opt/minecraft/
-  chown -R minecraft:minecraft /opt/minecraft/world /opt/minecraft/world_nether /opt/minecraft/world_the_end 2>/dev/null || true
-  rm -f /tmp/world.tar.gz
-  echo "World loaded from S3."
-else
-  echo "No world.tar.gz in s3://__BUCKET__/__VERSION__/ — using local world or generating fresh."
-fi
-systemctl start minecraft
-echo "Start complete."
-REMOTE
-)
-  fi
-
   REMOTE_SCRIPT="${REMOTE_SCRIPT//__BUCKET__/$BUCKET}"
-  REMOTE_SCRIPT="${REMOTE_SCRIPT//__VERSION__/$TARGET}"
   REMOTE_SCRIPT="${REMOTE_SCRIPT//__BUCKET_REGION__/$BUCKET_REGION}"
 
   SCRIPT_B64=$(printf '%s' "$REMOTE_SCRIPT" | base64 | tr -d '\n')
@@ -159,6 +136,14 @@ PUBLIC_IP=$(aws ec2 describe-instances \
   --output text)
 
 echo ""
-echo "Server is up."
+echo "Instance is up."
 echo "Public IP: $PUBLIC_IP (port 25565)"
+if [ "$IS_PGM" = "false" ]; then
+  echo ""
+  echo "Vanilla world sync runs on the instance via mc-pull-world.service."
+  echo "Watch progress:"
+  echo "  aws ssm start-session --target $INSTANCE_ID --region $REGION"
+  echo "  sudo journalctl -u mc-pull-world -u minecraft -f"
+fi
+echo ""
 echo "Allow ~30 seconds for Minecraft to finish loading the world."

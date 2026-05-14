@@ -64,7 +64,9 @@ aws cloudformation describe-stacks \
 
 echo ""
 echo "Next steps:"
-echo "  1. Open Session Manager from the SessionManagerConsole URL above"
-echo "  2. Upload PGM map folders to /opt/minecraft/maps/ — each map needs a map.xml"
-echo "     See https://pgm.dev/docs/map/ for the map spec"
-echo "  3. Restart the server after adding maps: sudo systemctl restart minecraft"
+echo "  1. Allow ~3 minutes for UserData to finish: Java install, jar downloads,"
+echo "     and the initial clone of https://github.com/PGMDev/Maps (5 default maps)."
+echo "  2. Connect at the PublicIP above on port 25565 — default maps load automatically."
+echo "  3. To add custom maps: upload map folders to s3://mc-worlds-<account>/pgm-maps/"
+echo "     and restart: sudo systemctl restart minecraft"
+echo "     Each map folder must contain a map.xml — see https://pgm.dev/docs/map/"

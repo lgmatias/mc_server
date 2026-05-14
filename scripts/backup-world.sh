@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Archive the Minecraft world from the EBS data volume of a server stack and
+# Snapshot the Minecraft world from the EBS data volume of a server stack and
 # upload it to the shared S3 bucket (mc-worlds-<account>). Works whether the
 # instance is running or stopped — a stopped instance is started temporarily
-# for the backup and stopped again afterwards.
+# for the snapshot and stopped again afterwards.
 #
-# Backups land at:
-#   s3://mc-worlds-<account>/<version>/worlds-YYYYMMDDTHHMMSSZ.tar.gz
+# Snapshots land at (one prefix per timestamp, one sub-prefix per directory):
+#   s3://mc-worlds-<account>/<version>/snapshots/YYYYMMDDTHHMMSSZ/<dir>/...
+# where <dir> is one of: world, world_nether, world_the_end, maps.
 #
 # Prerequisites:
 #   - deploy-worlds-bucket.sh has been run (creates the bucket)
@@ -100,7 +101,7 @@ if [ "$WAS_STOPPED" = "true" ]; then
 fi
 
 TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
-S3_KEY="${S3_PREFIX}/worlds-${TIMESTAMP}.tar.gz"
+S3_PREFIX_PATH="${S3_PREFIX}/snapshots/${TIMESTAMP}"
 
 REMOTE_SCRIPT=$(cat <<'REMOTE'
 set -euo pipefail
@@ -113,26 +114,26 @@ if [ -z "$TARGETS" ]; then
   echo "No world directories found at /opt/minecraft — has the server finished its first run?" >&2
   exit 1
 fi
-echo "Archiving:$TARGETS"
+echo "Snapshotting:$TARGETS"
 systemctl stop minecraft || true
-tar czf /tmp/worlds.tar.gz $TARGETS
-echo "Uploading to s3://__BUCKET__/__KEY__"
-aws --region __BUCKET_REGION__ s3 cp /tmp/worlds.tar.gz s3://__BUCKET__/__KEY__
-rm -f /tmp/worlds.tar.gz
+for d in $TARGETS; do
+  echo "Syncing $d -> s3://__BUCKET__/__PREFIX_PATH__/$d/"
+  aws --region __BUCKET_REGION__ s3 sync "$d" "s3://__BUCKET__/__PREFIX_PATH__/$d/"
+done
 if [ "__RESTART_MC__" = "true" ]; then
   systemctl start minecraft
 fi
-echo "Backup complete."
+echo "Snapshot complete."
 REMOTE
 )
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__BUCKET__/$BUCKET}"
-REMOTE_SCRIPT="${REMOTE_SCRIPT//__KEY__/$S3_KEY}"
+REMOTE_SCRIPT="${REMOTE_SCRIPT//__PREFIX_PATH__/$S3_PREFIX_PATH}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__BUCKET_REGION__/$BUCKET_REGION}"
 REMOTE_SCRIPT="${REMOTE_SCRIPT//__RESTART_MC__/$RESTART_MC}"
 
 SCRIPT_B64=$(printf '%s' "$REMOTE_SCRIPT" | base64 | tr -d '\n')
 
-echo "Sending backup command to $INSTANCE_ID (bucket in $BUCKET_REGION)..."
+echo "Sending snapshot command to $INSTANCE_ID (bucket in $BUCKET_REGION)..."
 COMMAND_ID=$(aws ssm send-command \
   --region "$REGION" \
   --instance-ids "$INSTANCE_ID" \
@@ -141,7 +142,7 @@ COMMAND_ID=$(aws ssm send-command \
   --query 'Command.CommandId' --output text)
 echo "SSM CommandId: $COMMAND_ID"
 
-echo -n "Waiting for completion (may take a few minutes)"
+echo -n "Waiting for completion (first snapshot is slowest; later runs are incremental)"
 while true; do
   STATUS=$(aws ssm get-command-invocation \
     --region "$REGION" \
@@ -159,7 +160,7 @@ while true; do
       ;;
     *)
       echo ""
-      echo "Backup failed (status: $STATUS)." >&2
+      echo "Snapshot failed (status: $STATUS)." >&2
       aws ssm get-command-invocation \
         --region "$REGION" \
         --command-id "$COMMAND_ID" \
@@ -177,17 +178,17 @@ done
 
 if [ "$WAS_STOPPED" = "true" ]; then
   echo ""
-  echo "Stopping instance again (it was stopped before the backup)..."
+  echo "Stopping instance again (it was stopped before the snapshot)..."
   aws ec2 stop-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
     --output text --query 'StoppingInstances[0].CurrentState.Name' >/dev/null
 fi
 
 echo ""
-echo "Backup uploaded:"
-echo "  s3://${BUCKET}/${S3_KEY}"
+echo "Snapshot uploaded:"
+echo "  s3://${BUCKET}/${S3_PREFIX_PATH}/"
 echo ""
-echo "Download locally:"
-echo "  aws s3 cp s3://${BUCKET}/${S3_KEY} ./worlds-${TIMESTAMP}.tar.gz --region $BUCKET_REGION"
+echo "Download locally (mirrors the full tree to ./snapshot-${TIMESTAMP}/):"
+echo "  aws s3 sync s3://${BUCKET}/${S3_PREFIX_PATH}/ ./snapshot-${TIMESTAMP}/ --region $BUCKET_REGION"
 echo ""
-echo "List all backups for this version:"
-echo "  aws s3 ls s3://${BUCKET}/${S3_PREFIX}/ --region $BUCKET_REGION"
+echo "List all snapshots for this version:"
+echo "  aws s3 ls s3://${BUCKET}/${S3_PREFIX}/snapshots/ --region $BUCKET_REGION"

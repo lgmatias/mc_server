@@ -89,6 +89,7 @@ Resources:
                 Action:
                   - s3:PutObject
                   - s3:GetObject
+                  - s3:DeleteObject
                   - s3:GetBucketLocation
                 Resource: !Sub 'arn:aws:s3:::mc-worlds-${AWS::AccountId}/*'
               - Effect: Allow
@@ -152,16 +153,28 @@ Resources:
           if [ -z "$PATCH_RAW" ]; then PATCH=0; else PATCH=$PATCH_RAW; fi
 
           if [ "$MINOR" -ge 20 ] && [ "$PATCH" -ge 5 ]; then
-            JAVA_PKG="java-21-amazon-corretto-headless"
+            CORRETTO_RPM=amazon-corretto-21-x64-linux-jdk.rpm
           elif [ "$MINOR" -ge 17 ]; then
-            JAVA_PKG="java-17-amazon-corretto-headless"
+            CORRETTO_RPM=amazon-corretto-17-x64-linux-jdk.rpm
           else
-            JAVA_PKG="java-1.8.0-amazon-corretto-headless"
+            CORRETTO_RPM=amazon-corretto-8-x64-linux-jdk.rpm
           fi
 
-          rpm --import https://yum.corretto.aws/corretto.key
-          curl -fsSL https://yum.corretto.aws/corretto.repo -o /etc/yum.repos.d/corretto.repo
-          yum install -y $JAVA_PKG python3 curl
+          # Install Corretto directly from corretto.aws. The Corretto yum repo
+          # cannot be used here: AL2's yum-plugin-priorities silently excludes
+          # its packages ("No package ... available" even with the repo file
+          # in place), and yum still exits 0 when other packages on the same
+          # line are already installed — so `set -e` would NOT catch the missing
+          # JVM. Same workaround as pgm-server.yml.
+          curl -fsSL -o /tmp/corretto.rpm "https://corretto.aws/downloads/latest/$CORRETTO_RPM"
+          yum install -y /tmp/corretto.rpm
+          rm -f /tmp/corretto.rpm
+
+          yum install -y python3 curl
+
+          # Defense in depth: if Java still isn't on PATH, fail UserData loudly
+          # rather than letting systemd crash-loop the service silently.
+          command -v java >/dev/null || { echo "Java install failed — aborting"; exit 1; }
 
           # Wait for the data volume attachment to appear (Nitro: nvme1n1; legacy: xvdf/sdf)
           DEVICE=""
@@ -232,34 +245,69 @@ Resources:
           PROPEOF
           fi
 
-          # First-boot world restore: if the data volume has no world yet but the
-          # shared S3 bucket has one for this version, pull it down. On instance
-          # replacement (volume preserved) this is a no-op since level.dat exists.
-          if [ ! -f /opt/minecraft/world/level.dat ]; then
-            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
-            if [ -n "$ACCOUNT_ID" ]; then
-              BUCKET=mc-worlds-$ACCOUNT_ID
-              BUCKET_REGION=$(aws s3api get-bucket-location --bucket "$BUCKET" \
-                --query 'LocationConstraint' --output text 2>/dev/null || echo "")
-              if [ -z "$BUCKET_REGION" ] || [ "$BUCKET_REGION" = "None" ] || [ "$BUCKET_REGION" = "null" ]; then
-                BUCKET_REGION=us-east-1
-              fi
-              if aws --region "$BUCKET_REGION" s3 ls "s3://$BUCKET/$MC_VERSION/world.tar.gz" >/dev/null 2>&1; then
-                echo "Restoring world from s3://$BUCKET/$MC_VERSION/world.tar.gz..."
-                aws --region "$BUCKET_REGION" s3 cp "s3://$BUCKET/$MC_VERSION/world.tar.gz" /tmp/world.tar.gz
-                tar xzf /tmp/world.tar.gz -C /opt/minecraft/
-                rm -f /tmp/world.tar.gz
-              fi
-            fi
-          fi
-
           chown -R minecraft:minecraft /opt/minecraft
+
+          # World sync from S3 runs on every boot via a oneshot systemd unit
+          # (mc-pull-world.service) that orders Before=minecraft.service. The
+          # logic:
+          #   - For each dim (world, world_nether, world_the_end), if S3 has any
+          #     objects under <version>/<dim>/, wipe the local dir and sync down.
+          #   - If S3 has no objects for a dim, leave the local dir alone.
+          # This preserves the migration-snapshot path (S3 empty -> data volume
+          # contents preserved) while making S3 authoritative whenever it has
+          # content. server-stop.sh remains the canonical "push to S3" path.
+          cat > /opt/minecraft/pull-world.sh << PULLEOF
+          #!/bin/bash
+          set -euo pipefail
+          MC_VERSION="$MC_VERSION"
+          ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")
+          if [ -z "\$ACCOUNT_ID" ]; then
+            echo "pull-world: no AWS identity, skipping S3 sync" >&2
+            exit 0
+          fi
+          BUCKET="mc-worlds-\$ACCOUNT_ID"
+          BUCKET_REGION=\$(aws s3api get-bucket-location --bucket "\$BUCKET" \\
+            --query 'LocationConstraint' --output text 2>/dev/null || echo "")
+          if [ -z "\$BUCKET_REGION" ] || [ "\$BUCKET_REGION" = "None" ] || [ "\$BUCKET_REGION" = "null" ]; then
+            BUCKET_REGION=us-east-1
+          fi
+          for d in world world_nether world_the_end; do
+            if aws --region "\$BUCKET_REGION" s3 ls "s3://\$BUCKET/\$MC_VERSION/\$d/" 2>/dev/null | grep -q .; then
+              echo "pull-world: wiping /opt/minecraft/\$d and syncing from s3://\$BUCKET/\$MC_VERSION/\$d/"
+              rm -rf "/opt/minecraft/\$d"
+              aws --region "\$BUCKET_REGION" s3 sync "s3://\$BUCKET/\$MC_VERSION/\$d/" "/opt/minecraft/\$d/"
+            else
+              echo "pull-world: s3://\$BUCKET/\$MC_VERSION/\$d/ empty — leaving local \$d alone"
+            fi
+          done
+          chown -R minecraft:minecraft /opt/minecraft/world /opt/minecraft/world_nether /opt/minecraft/world_the_end 2>/dev/null || true
+          PULLEOF
+          chmod +x /opt/minecraft/pull-world.sh
+
+          cat > /etc/systemd/system/mc-pull-world.service << 'PULLSVCEOF'
+          [Unit]
+          Description=Sync Minecraft world from S3 (runs once at boot before minecraft.service)
+          After=network-online.target opt-minecraft.mount
+          Wants=network-online.target
+          Requires=opt-minecraft.mount
+          Before=minecraft.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/opt/minecraft/pull-world.sh
+          RemainAfterExit=yes
+          StandardOutput=journal
+          StandardError=journal
+
+          [Install]
+          WantedBy=multi-user.target
+          PULLSVCEOF
 
           cat > /etc/systemd/system/minecraft.service << 'SVCEOF'
           [Unit]
           Description=Minecraft Server
-          After=network.target opt-minecraft.mount
-          Requires=opt-minecraft.mount
+          After=network.target opt-minecraft.mount mc-pull-world.service
+          Requires=opt-minecraft.mount mc-pull-world.service
 
           [Service]
           User=minecraft
@@ -275,7 +323,7 @@ Resources:
           SVCEOF
 
           systemctl daemon-reload
-          systemctl enable minecraft
+          systemctl enable mc-pull-world minecraft
           systemctl start minecraft
 
   DataVolumeAttachment:

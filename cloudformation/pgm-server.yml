@@ -81,6 +81,7 @@ Resources:
                 Action:
                   - s3:PutObject
                   - s3:GetObject
+                  - s3:DeleteObject
                   - s3:GetBucketLocation
                 Resource: !Sub 'arn:aws:s3:::mc-worlds-${AWS::AccountId}/*'
               - Effect: Allow
@@ -134,12 +135,27 @@ Resources:
           set -euo pipefail
           exec > /var/log/mc-pgm-setup.log 2>&1
 
-          PGM_RELEASE="v0.15"
+          PGM_RELEASE="v0.14"
           BASE_URL="https://github.com/PGMDev/PGM/releases/download/$PGM_RELEASE"
 
-          rpm --import https://yum.corretto.aws/corretto.key
-          curl -fsSL https://yum.corretto.aws/corretto.repo -o /etc/yum.repos.d/corretto.repo
-          yum install -y java-1.8.0-amazon-corretto-headless curl
+          # Use Java 8 (Corretto 8). This pins down two separate
+          # incompatibilities at once:
+          #   (1) PGM v0.15 has Java-8-era NMSHacks reflection that touches
+          #       java.lang.reflect.Field.modifiers — a field removed in
+          #       Java 12+. PGM v0.14 still has the same code, so any JVM 12+
+          #       breaks the NMSHacks clinit and PGM disables itself.
+          #   (2) SportPaper bundles a 1.8-era Netty 4.0 that does direct-buffer
+          #       access via sun.misc.Unsafe. On Java 9+ this throws
+          #       "Unable to access address of buffer" on every client read,
+          #       which presents to the client as "Connection reset".
+          # Java 8 sidesteps both. We install the Corretto 8 RPM directly from
+          # corretto.aws because AL2's yum-plugin-priorities silently excludes
+          # the Corretto yum repo's packages ("No package ... available" even
+          # though the repo file is present).
+          curl -fsSL -o /tmp/corretto.rpm \
+            https://corretto.aws/downloads/latest/amazon-corretto-8-x64-linux-jdk.rpm
+          yum install -y /tmp/corretto.rpm
+          rm -f /tmp/corretto.rpm
 
           DEVICE=""
           for i in $(seq 1 60); do
@@ -169,11 +185,19 @@ Resources:
           id minecraft &>/dev/null || \
             useradd -r -d /opt/minecraft -s /sbin/nologin minecraft
 
+          # Layout mirrors the PGM local-server-setup guide:
+          #   /opt/minecraft/SportPaper.jar
+          #   /opt/minecraft/start.sh
+          #   /opt/minecraft/server.properties
+          #   /opt/minecraft/plugins/PGM.jar
+          #   /opt/minecraft/plugins/PGM/config.yml
+          #   /opt/minecraft/maps/         (custom maps, synced from S3)
+          #   /opt/minecraft/default-maps/ (cloned by PGM from PGMDev/Maps on first run)
           mkdir -p /opt/minecraft/plugins/PGM /opt/minecraft/maps
 
-          # Only download jars on first deploy
-          if [ ! -f /opt/minecraft/server.jar ]; then
-            curl -fsSL "$BASE_URL/SportPaper.jar" -o /opt/minecraft/server.jar
+          # Only download jars on first deploy. Keep SportPaper.jar named per the guide.
+          if [ ! -f /opt/minecraft/SportPaper.jar ]; then
+            curl -fsSL "$BASE_URL/SportPaper.jar" -o /opt/minecraft/SportPaper.jar
           fi
           if [ ! -f /opt/minecraft/plugins/PGM.jar ]; then
             curl -fsSL "$BASE_URL/PGM.jar" -o /opt/minecraft/plugins/PGM.jar
@@ -188,16 +212,32 @@ Resources:
           max-players=40
           motd=PGM Server
           view-distance=6
+          announce-player-achievements=false
+          generate-structures=false
           PROPEOF
           fi
 
           if [ ! -f /opt/minecraft/plugins/PGM/config.yml ]; then
             cat > /opt/minecraft/plugins/PGM/config.yml << 'CFGEOF'
-          maps:
-            uri: ~
-            source: "file"
-            path: "/opt/minecraft/maps"
+          map:
+            folders:
+              - "maps"
+            repositories:
+              - uri: "https://github.com/PGMDev/Maps"
+                path: "default-maps"
           CFGEOF
+          fi
+
+          # start.sh follows the Linux variant from the PGM setup guide. JVM
+          # flags come straight from the guide; -Xmx is templated from the
+          # ServerMemoryMB stack parameter (substituted by CloudFormation Sub).
+          if [ ! -f /opt/minecraft/start.sh ]; then
+            cat > /opt/minecraft/start.sh << 'STARTEOF'
+          #!/bin/sh
+          cd "$(dirname "$0")"
+          exec java -Xms128M -Xmx${ServerMemoryMB}M -Dterminal.jline=false -Dterminal.ansi=true -jar SportPaper.jar nogui
+          STARTEOF
+            chmod +x /opt/minecraft/start.sh
           fi
 
           # Map sync: the S3 folder s3://<bucket>/pgm-maps/ is the source of
@@ -229,7 +269,7 @@ Resources:
           [Service]
           User=minecraft
           WorkingDirectory=/opt/minecraft
-          ExecStart=/usr/bin/java -Xmx${ServerMemoryMB}M -Xms${ServerMemoryMB}M -jar server.jar nogui
+          ExecStart=/opt/minecraft/start.sh
           ExecStop=/bin/kill -SIGTERM $MAINPID
           Restart=on-failure
           RestartSec=30

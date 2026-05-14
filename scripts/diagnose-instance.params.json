@@ -1,0 +1,41 @@
+{
+  "Parameters": {
+    "commands": [
+      "echo '===== USERDATA SETUP LOG ====='",
+      "for f in /var/log/mc-pgm-setup.log /var/log/mc-setup.log /var/log/cloud-init-output.log; do [ -f \"$f\" ] && echo \"--- $f ---\" && sed 's/[^[:print:][:space:]]//g' \"$f\" | tail -150; done",
+      "echo",
+      "echo '===== SYSTEMD STATUS ====='",
+      "systemctl status minecraft --no-pager 2>&1 | sed 's/[^[:print:][:space:]]//g' | head -30 || true",
+      "echo",
+      "echo '===== JOURNAL (minecraft service) ====='",
+      "journalctl -u minecraft --no-pager -n 120 2>&1 | sed 's/[^[:print:][:space:]]//g' || true",
+      "echo",
+      "echo '===== FILE TREE ====='",
+      "ls -la /opt/minecraft/ 2>&1 || true",
+      "echo '--- plugins ---'",
+      "ls -la /opt/minecraft/plugins/ 2>&1 || true",
+      "echo '--- plugins/PGM ---'",
+      "ls -la /opt/minecraft/plugins/PGM/ 2>&1 || true",
+      "echo '--- maps ---'",
+      "ls -la /opt/minecraft/maps/ 2>&1 || true",
+      "echo '--- default-maps / sample-github-maps ---'",
+      "ls -la /opt/minecraft/default-maps/ 2>&1 || true",
+      "ls -la /opt/minecraft/sample-github-maps/ 2>&1 || true",
+      "echo",
+      "echo '===== PGM CONFIG.YML ====='",
+      "cat /opt/minecraft/plugins/PGM/config.yml 2>&1 || echo 'NO CONFIG'",
+      "echo",
+      "echo '===== SERVER.PROPERTIES ====='",
+      "cat /opt/minecraft/server.properties 2>&1 || echo 'NO PROPS'",
+      "echo",
+      "echo '===== JAVA VERSION ====='",
+      "java -version 2>&1 || echo 'NO JAVA'",
+      "echo",
+      "echo '===== SERVER LOG (latest.log) ====='",
+      "tail -120 /opt/minecraft/logs/latest.log 2>&1 | sed 's/[^[:print:][:space:]]//g' || echo 'NO SERVER LOG'",
+      "echo",
+      "echo '===== PORT 25565 ====='",
+      "ss -tlnp 2>&1 | grep -E '25565|LISTEN' | head -10 || true"
+    ]
+  }
+}
