@@ -1,1 +1,8 @@
 .claude-notes/
+.claude/
+
+# share-access/ is tracked in git (setup script, launcher, SECRETS template),
+# but never the live credentials or a bundled portable Git. The real SECRETS
+# file is created locally from share-access/SECRETS.template.
+share-access/SECRETS
+share-access/PortableGit/

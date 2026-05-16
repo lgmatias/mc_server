@@ -60,7 +60,9 @@ if [ "$TARGET" = "pgm" ]; then
 else
   IS_PGM=false
   MC_VERSION="$TARGET"
-  STACK_NAME="mc-$(echo "$MC_VERSION" | tr '.' '-')"
+  # tr maps '.' and '_' → '-': CFN stack names allow only alphanumerics and
+  # hyphens, and alpha version ids (e.g. a1.1.2_01) contain an underscore.
+  STACK_NAME="mc-$(echo "$MC_VERSION" | tr '._' '-')"
   TEMPLATE="$SCRIPT_DIR/../cloudformation/mc-server.yml"
   TARGET_DESC="Minecraft $MC_VERSION"
 fi
@@ -108,8 +110,34 @@ else
   fi
 fi
 
+# The vanilla template (mc-server.yml) is architecture-aware: it picks the AMI
+# from InstanceArchitecture and sizes the JVM heap from ServerMemoryMB. Derive
+# both from the chosen instance type so any family — x86 or Graviton/ARM —
+# works. PGM is left x86/t3-class, so this is vanilla-only.
+INSTANCE_ARCH=x86_64
+SERVER_MEMORY=2048
+if [ "$IS_PGM" != "true" ]; then
+  IT_INFO=$(aws ec2 describe-instance-types --region "$REGION" --instance-types "$INSTANCE_TYPE" \
+    --query 'InstanceTypes[0].[ProcessorInfo.SupportedArchitectures[0],MemoryInfo.SizeInMiB]' \
+    --output text 2>/dev/null || echo "")
+  case "$(echo "$IT_INFO" | awk '{print $1}')" in
+    *arm64*) INSTANCE_ARCH=arm64 ;;
+    *)       INSTANCE_ARCH=x86_64 ;;
+  esac
+  IT_MEM=$(echo "$IT_INFO" | awk '{print $2}')
+  if [ -n "$IT_MEM" ] && [ "$IT_MEM" != "None" ]; then
+    # Heap = instance RAM minus ~1 GB for the OS (matches the template guidance).
+    SERVER_MEMORY=$((IT_MEM - 1024))
+    [ "$SERVER_MEMORY" -lt 512 ] && SERVER_MEMORY=512
+  fi
+fi
+
 echo "Target: $TARGET_DESC as stack '$STACK_NAME' in $REGION"
 echo "  Instance type: $INSTANCE_TYPE  ($INSTANCE_TYPE_SRC)"
+if [ "$IS_PGM" != "true" ]; then
+  echo "  Architecture:  $INSTANCE_ARCH  (auto-detected)"
+  echo "  Server heap:   ${SERVER_MEMORY} MB  (instance RAM minus ~1 GB for the OS)"
+fi
 echo "  Volume size:   ${VOLUME_SIZE} GB  ($VOLUME_SIZE_SRC)"
 echo ""
 
@@ -124,7 +152,9 @@ else
   PARAMS=(
     "MinecraftVersion=$MC_VERSION"
     "InstanceType=$INSTANCE_TYPE"
+    "InstanceArchitecture=$INSTANCE_ARCH"
     "VolumeSize=$VOLUME_SIZE"
+    "ServerMemoryMB=$SERVER_MEMORY"
   )
 fi
 

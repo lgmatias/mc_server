@@ -27,7 +27,7 @@ if [ "$TARGET" = "pgm" ]; then
   STACK_NAME="pgm"
   S3_PREFIX="pgm"
 else
-  STACK_NAME="mc-$(echo "$TARGET" | tr '.' '-')"
+  STACK_NAME="mc-$(echo "$TARGET" | tr '._' '-')"
   S3_PREFIX="$TARGET"
 fi
 

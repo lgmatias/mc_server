@@ -11,21 +11,34 @@ Parameters:
     Type: String
     Default: '1.20.4'
     Description: >
-      Minecraft server version (e.g. 1.20.4, 1.19.4, 1.16.5, 1.8.9).
-      Java is selected automatically: <1.17 → Java 8, 1.17-1.20.4 → Java 17, ≥1.20.5 → Java 21.
+      Minecraft server version (e.g. 1.20.4, 1.19.4, 1.16.5, 1.8.9, 26.1).
+      Java is selected automatically: <1.17 → Java 8, 1.17-1.20.4 → Java 17,
+      1.20.5-1.21.x → Java 21, ≥26.1 (new YY.N scheme) → Java 25.
 
   InstanceType:
     Type: String
     Default: t3.medium
-    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge]
-    Description: t3.medium (2 vCPU / 4 GB) handles ~10 players. Changing this replaces the instance; the data volume is preserved.
+    Description: >
+      EC2 instance type — any family works, x86 or Graviton/ARM. deploy.sh
+      auto-detects the architecture. t3.medium (2 vCPU / 4 GB) handles ~10
+      players; a smaller type is fine for a handful of players. Changing this
+      replaces the instance; the data volume is preserved.
+
+  InstanceArchitecture:
+    Type: String
+    Default: x86_64
+    AllowedValues: [x86_64, arm64]
+    Description: >
+      CPU architecture of InstanceType — selects the matching Amazon Linux AMI.
+      deploy.sh sets this automatically from the chosen instance type; override
+      it only for a manual `cloudformation deploy`.
 
   ServerMemoryMB:
     Type: Number
     Default: 2048
     MinValue: 512
     MaxValue: 14336
-    Description: JVM heap size in MB. Leave ~1 GB for the OS.
+    Description: JVM heap size in MB (~1 GB is left for the OS). deploy.sh sets this from the instance's RAM.
 
   VolumeSize:
     Type: Number
@@ -113,7 +126,7 @@ Resources:
     Properties:
       InstanceType: !Ref InstanceType
       AvailabilityZone: !Select [0, !GetAZs '']
-      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-${InstanceArchitecture}-gp2}}'
       IamInstanceProfile: !Ref SsmInstanceProfile
       SecurityGroups:
         - !Ref MinecraftSG
@@ -136,24 +149,60 @@ Resources:
 
           MC_VERSION="${MinecraftVersion}"
 
-          # Determine required Java version from minor.patch
+          # Determine required Java version from the version string.
+          MAJOR=$(echo "$MC_VERSION" | cut -d. -f1)
           MINOR=$(echo "$MC_VERSION" | cut -d. -f2)
           PATCH_RAW=$(echo "$MC_VERSION" | cut -d. -f3)
           if [ -z "$PATCH_RAW" ]; then PATCH=0; else PATCH=$PATCH_RAW; fi
 
           # Mojang's Java requirements:
           #   ≤ 1.16.5         → Java 8
-          #   1.17 - 1.20.4    → Java 17 (Mojang said 16 for 1.17 but 17 works there too)
-          #   ≥ 1.20.5         → Java 21
-          # Earlier this script used `MINOR -ge 20 && PATCH -ge 5` for the Java 21
-          # branch, which silently mispicked Java 17 for any MINOR > 20 (e.g. 1.21.0
-          # has PATCH=0, so the AND failed). Correct form: MINOR > 20 OR (MINOR == 20 AND PATCH >= 5).
-          if [ "$MINOR" -gt 20 ] || { [ "$MINOR" -eq 20 ] && [ "$PATCH" -ge 5 ]; }; then
-            CORRETTO_RPM=amazon-corretto-21-x64-linux-jdk.rpm
+          #   1.17 - 1.20.4    → Java 17  (1.17 actually requires Java 16; Corretto
+          #                                16 isn't in the corretto.aws `latest`
+          #                                path, so 1.17 rides on 17 — forward-
+          #                                compatible. Hence the boundary stays at
+          #                                MINOR ≥ 17, NOT 1.18: routing 1.17 to
+          #                                Java 8 would fail — 1.17 can't run on 8.)
+          #   1.20.5 - 1.21.x  → Java 21
+          #   ≥ 26.1           → Java 25  (new YY.N version scheme, e.g. 26.1)
+          #
+          # Three scheme families for the major (first dot-separated field):
+          #   - Non-numeric (a1.x alpha, b1.x beta, c0.x classic, rd-/inf- early
+          #     builds) — all predate the Java 8 floor → Corretto 8.
+          #   - "1" — classic "1.MINOR.PATCH" → MINOR/PATCH comparisons below.
+          #   - Numeric ≥ 2 — the new "YEAR.N" scheme (26.1+) → Corretto 25.
+          #     Under the new scheme MINOR is no longer a Minecraft minor, so the
+          #     MINOR-based comparisons must NOT run for it — hence the early branch.
+          #
+          # History: an earlier revision used `MINOR -ge 20 && PATCH -ge 5` for the
+          # Java 21 branch, which mispicked Java 17 for any MINOR > 20 (1.21.0 has
+          # PATCH=0, so the AND failed). Correct form: MINOR > 20 OR (MINOR == 20
+          # AND PATCH >= 5).
+          # online-mode: alpha/beta clients authenticated against Mojang's
+          # legacy session servers, long since shut down. Leave auth on for
+          # every numeric version; disable it for non-numeric (alpha/beta)
+          # majors, or no client can join.
+          ONLINE_MODE=true
+
+          # Corretto RPM architecture suffix, taken from the instance's own CPU
+          # so this template works on x86_64 and Graviton/ARM alike:
+          #   x86_64 -> "x64",  aarch64 -> "aarch64".
+          case "$(uname -m)" in
+            aarch64) JDK_ARCH=aarch64 ;;
+            *)       JDK_ARCH=x64 ;;
+          esac
+
+          if ! echo "$MAJOR" | grep -qE '^[0-9]+$'; then
+            CORRETTO_RPM=amazon-corretto-8-$JDK_ARCH-linux-jdk.rpm
+            ONLINE_MODE=false
+          elif [ "$MAJOR" -ge 2 ]; then
+            CORRETTO_RPM=amazon-corretto-25-$JDK_ARCH-linux-jdk.rpm
+          elif [ "$MINOR" -gt 20 ] || { [ "$MINOR" -eq 20 ] && [ "$PATCH" -ge 5 ]; }; then
+            CORRETTO_RPM=amazon-corretto-21-$JDK_ARCH-linux-jdk.rpm
           elif [ "$MINOR" -ge 17 ]; then
-            CORRETTO_RPM=amazon-corretto-17-x64-linux-jdk.rpm
+            CORRETTO_RPM=amazon-corretto-17-$JDK_ARCH-linux-jdk.rpm
           else
-            CORRETTO_RPM=amazon-corretto-8-x64-linux-jdk.rpm
+            CORRETTO_RPM=amazon-corretto-8-$JDK_ARCH-linux-jdk.rpm
           fi
 
           # Install Corretto directly from corretto.aws. The Corretto yum repo
@@ -228,18 +277,30 @@ Resources:
           import json
           with open('/tmp/version.json') as f:
               data = json.load(f)
-          print(data['downloads']['server']['url'])
+          # Alpha/beta version JSONs expose only downloads.client — no server.
+          print(data.get('downloads', {}).get('server', {}).get('url', ''))
           PYEOF
           )
-            curl -fsSL "$SERVER_URL" -o /opt/minecraft/server.jar
+            if [ -n "$SERVER_URL" ]; then
+              curl -fsSL "$SERVER_URL" -o /opt/minecraft/server.jar
+            else
+              # Mojang has no server jar for this version (alpha/beta). Fall back
+              # to a jar staged in the worlds bucket under server-jars/. Pre-stage
+              # with: aws s3 cp <jar> s3://mc-worlds-<acct>/server-jars/<version>.jar
+              JAR_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+              JAR_BUCKET="mc-worlds-$JAR_ACCOUNT"
+              echo "No Mojang server jar for $MC_VERSION — pulling s3://$JAR_BUCKET/server-jars/$MC_VERSION.jar"
+              aws s3 cp "s3://$JAR_BUCKET/server-jars/$MC_VERSION.jar" /opt/minecraft/server.jar
+            fi
           fi
 
           [ -f /opt/minecraft/eula.txt ] || echo "eula=true" > /opt/minecraft/eula.txt
 
           if [ ! -f /opt/minecraft/server.properties ]; then
-            cat > /opt/minecraft/server.properties << 'PROPEOF'
+            cat > /opt/minecraft/server.properties << PROPEOF
           server-port=25565
-          online-mode=true
+          level-name=world
+          online-mode=$ONLINE_MODE
           max-players=20
           motd=Minecraft Server
           view-distance=10

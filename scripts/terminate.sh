@@ -50,7 +50,7 @@ REGION="${POSITIONAL[1]:-us-east-1}"
 if [ "$TARGET" = "pgm" ]; then
   STACK_NAME="pgm"
 else
-  STACK_NAME="mc-$(echo "$TARGET" | tr '.' '-')"
+  STACK_NAME="mc-$(echo "$TARGET" | tr '._' '-')"
 fi
 
 # Bail early if the stack doesn't exist — no work to do.

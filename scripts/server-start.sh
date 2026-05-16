@@ -47,7 +47,7 @@ if [ "$TARGET" = "pgm" ]; then
   STACK_NAME="pgm"
   IS_PGM=true
 else
-  STACK_NAME="mc-$(echo "$TARGET" | tr '.' '-')"
+  STACK_NAME="mc-$(echo "$TARGET" | tr '._' '-')"
   IS_PGM=false
 fi
 

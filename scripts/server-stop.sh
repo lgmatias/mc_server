@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Stop the EC2 instance for a Minecraft server.
 #
-# For vanilla stacks (mc-X-Y-Z): before stopping, sync the world directories
-# from the data volume up to s3://mc-worlds-<account>/<version>/<dim>/ (one
-# top-level prefix per dimension: world, world_nether, world_the_end). This is
-# the canonical world for that version; --delete on the sync keeps S3 in
-# lockstep with the on-disk state. server-start.sh pulls this back down on the
-# next start. No tarball — incremental sync transfers only changed region files.
+# For vanilla stacks (mc-X-Y-Z): before stopping, sync the world directory from
+# the data volume up to s3://mc-worlds-<account>/<version>/world/. Vanilla Java
+# Edition keeps a single world directory (nether DIM-1 and end DIM1 are subdirs
+# of it), so one `aws s3 sync` carries the whole world. The world directory is
+# resolved at save time (from level-name in server.properties, else by locating
+# level.dat), so the save works for any Minecraft era — Alpha base-36 .dat
+# chunks, Beta McRegion .mcr, modern Anvil .mca. --delete keeps S3 in lockstep
+# with disk; mc-pull-world.service pulls it back down on the next start.
 #
 # For PGM: no world auto-save (PGM maps live in s3://.../pgm-maps/ and are
 # managed manually). The instance is just stopped.
@@ -28,7 +30,7 @@ if [ "$TARGET" = "pgm" ]; then
   STACK_NAME="pgm"
   IS_PGM=true
 else
-  STACK_NAME="mc-$(echo "$TARGET" | tr '.' '-')"
+  STACK_NAME="mc-$(echo "$TARGET" | tr '._' '-')"
   IS_PGM=false
 fi
 
@@ -66,17 +68,40 @@ if [ "$STATE" = "running" ] && [ "$IS_PGM" = "false" ]; then
     REMOTE_SCRIPT=$(cat <<'REMOTE'
 set -euo pipefail
 cd /opt/minecraft
-# Vanilla Java Edition uses one world directory; nether (DIM-1) and end (DIM1)
-# are subdirectories under it, NOT separate top-level dirs. `aws s3 sync world/`
-# carries both along.
-if [ ! -d world ]; then
-  echo "No world directory on this instance — nothing to save."
-  exit 0
-fi
-echo "Stopping minecraft and syncing world/ (DIM-1 nether + DIM1 end included)"
+
+# Stop Minecraft first so the world is flushed to disk before the sync: SIGTERM
+# triggers the server's save-and-quit shutdown hook.
 systemctl stop minecraft || true
-echo "Syncing world -> s3://__BUCKET__/__VERSION__/world/"
-aws --region __BUCKET_REGION__ s3 sync world "s3://__BUCKET__/__VERSION__/world/" --delete
+
+# Resolve the world directory. Normally /opt/minecraft/world (UserData pins
+# level-name=world in server.properties), but resolve it robustly so the save
+# works for any layout. Every Minecraft era keeps a single level.dat at the
+# world root — Alpha base-36 .dat chunks, Beta McRegion .mcr, modern Anvil .mca
+# — so the chunk format is irrelevant here: `aws s3 sync` copies the directory
+# tree verbatim. We only need the right directory.
+#   1. level-name from server.properties, if that directory has a level.dat
+#   2. else ./world, if it has a level.dat
+#   3. else whichever directory under /opt/minecraft holds a level.dat
+WORLD_DIR=""
+LEVEL_NAME=$(sed -n 's/^level-name=//p' server.properties 2>/dev/null | tr -d '\r' || true)
+if [ -n "$LEVEL_NAME" ] && [ -f "$LEVEL_NAME/level.dat" ]; then
+  WORLD_DIR="$LEVEL_NAME"
+elif [ -f world/level.dat ]; then
+  WORLD_DIR="world"
+else
+  FOUND=$(find . -maxdepth 2 -name level.dat -printf '%h\n' 2>/dev/null || true)
+  FIRST="${FOUND%%$'\n'*}"
+  WORLD_DIR="${FIRST#./}"
+fi
+
+if [ -z "$WORLD_DIR" ] || [ ! -d "$WORLD_DIR" ]; then
+  echo "ERROR: no world directory found under /opt/minecraft (no level.dat)." >&2
+  echo "  Nothing was saved to S3 — the server may not have generated a world yet." >&2
+  exit 1
+fi
+
+echo "Saving world directory '$WORLD_DIR' -> s3://__BUCKET__/__VERSION__/world/"
+aws --region __BUCKET_REGION__ s3 sync "$WORLD_DIR" "s3://__BUCKET__/__VERSION__/world/" --delete
 echo "Save complete."
 REMOTE
 )

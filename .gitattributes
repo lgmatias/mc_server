@@ -1,0 +1,7 @@
+# Keep shell scripts and YAML LF so they run correctly regardless of the OS the
+# repo is checked out on (a CRLF in a `#!` line breaks the script on Linux/Git
+# Bash). Keep Windows batch files CRLF.
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.bat  text eol=crlf
