@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Tear down every resource this project may have created across all regions:
 #   - mc-* and pgm CloudFormation stacks (and their orphaned data EBS volumes)
-#   - migration snapshots tagged Purpose=mc-migration
+#   - any legacy snapshots tagged Purpose=mc-migration (from when cross-region
+#     migration used EBS snapshots — that path is gone, but old snapshots may
+#     still exist on the account)
 #   - the mc-worlds-bucket CFN stack and the S3 bucket it manages
 #     (handles BOTH the old per-region pattern mc-worlds-<acct>-<region>
 #      and the new shared pattern mc-worlds-<acct>)
@@ -12,8 +14,50 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/migrate.sh
-source "$SCRIPT_DIR/lib/migrate.sh"
+
+# Resolve the region a bucket lives in (handles us-east-1 which returns null).
+bucket_region() {
+  local bucket=$1
+  local loc
+  loc=$(aws s3api get-bucket-location --bucket "$bucket" \
+    --query 'LocationConstraint' --output text 2>/dev/null || echo "")
+  if [ -z "$loc" ] || [ "$loc" = "None" ] || [ "$loc" = "null" ]; then
+    echo "us-east-1"
+  else
+    echo "$loc"
+  fi
+}
+
+# Empty a versioned S3 bucket — deletes every object version and delete marker.
+# Required before delete-bucket because the bucket has versioning enabled.
+empty_versioned_bucket() {
+  local bucket=$1
+  local region=$2
+  local tmp
+  tmp=$(mktemp)
+
+  while true; do
+    aws s3api list-object-versions --bucket "$bucket" --region "$region" --max-items 1000 \
+      --output json --query 'Versions[].{Key:Key,VersionId:VersionId}' > "$tmp" 2>/dev/null || break
+    local count
+    count=$(python3 -c "import json; d=json.load(open('$tmp')); print(len(d) if d else 0)" 2>/dev/null || echo 0)
+    [ "$count" = "0" ] && break
+    python3 -c "import json; d=json.load(open('$tmp')); json.dump({'Objects':d,'Quiet':True}, open('$tmp','w'))"
+    aws s3api delete-objects --bucket "$bucket" --region "$region" --delete "file://$tmp" >/dev/null
+  done
+
+  while true; do
+    aws s3api list-object-versions --bucket "$bucket" --region "$region" --max-items 1000 \
+      --output json --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' > "$tmp" 2>/dev/null || break
+    local count
+    count=$(python3 -c "import json; d=json.load(open('$tmp')); print(len(d) if d else 0)" 2>/dev/null || echo 0)
+    [ "$count" = "0" ] && break
+    python3 -c "import json; d=json.load(open('$tmp')); json.dump({'Objects':d,'Quiet':True}, open('$tmp','w'))"
+    aws s3api delete-objects --bucket "$bucket" --region "$region" --delete "file://$tmp" >/dev/null
+  done
+
+  rm -f "$tmp"
+}
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 

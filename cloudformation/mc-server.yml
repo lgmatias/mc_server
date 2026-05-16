@@ -39,16 +39,6 @@ Parameters:
     Default: '0.0.0.0/0'
     Description: CIDR block allowed to reach the Minecraft game port (25565). Restrict for private servers.
 
-  SnapshotId:
-    Type: String
-    Default: ''
-    Description: >
-      Optional EBS snapshot ID. If provided, the data volume is initialized from this snapshot
-      (used by deploy.sh during cross-region migration to carry the world from the old region).
-
-Conditions:
-  HasSnapshot: !Not [!Equals [!Ref SnapshotId, '']]
-
 Resources:
   MinecraftSG:
     Type: AWS::EC2::SecurityGroup
@@ -112,7 +102,6 @@ Resources:
       AvailabilityZone: !Select [0, !GetAZs '']
       Size: !Ref VolumeSize
       VolumeType: gp3
-      SnapshotId: !If [HasSnapshot, !Ref SnapshotId, !Ref AWS::NoValue]
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-data'
@@ -152,7 +141,14 @@ Resources:
           PATCH_RAW=$(echo "$MC_VERSION" | cut -d. -f3)
           if [ -z "$PATCH_RAW" ]; then PATCH=0; else PATCH=$PATCH_RAW; fi
 
-          if [ "$MINOR" -ge 20 ] && [ "$PATCH" -ge 5 ]; then
+          # Mojang's Java requirements:
+          #   ≤ 1.16.5         → Java 8
+          #   1.17 - 1.20.4    → Java 17 (Mojang said 16 for 1.17 but 17 works there too)
+          #   ≥ 1.20.5         → Java 21
+          # Earlier this script used `MINOR -ge 20 && PATCH -ge 5` for the Java 21
+          # branch, which silently mispicked Java 17 for any MINOR > 20 (e.g. 1.21.0
+          # has PATCH=0, so the AND failed). Correct form: MINOR > 20 OR (MINOR == 20 AND PATCH >= 5).
+          if [ "$MINOR" -gt 20 ] || { [ "$MINOR" -eq 20 ] && [ "$PATCH" -ge 5 ]; }; then
             CORRETTO_RPM=amazon-corretto-21-x64-linux-jdk.rpm
           elif [ "$MINOR" -ge 17 ]; then
             CORRETTO_RPM=amazon-corretto-17-x64-linux-jdk.rpm
@@ -166,9 +162,14 @@ Resources:
           # in place), and yum still exits 0 when other packages on the same
           # line are already installed — so `set -e` would NOT catch the missing
           # JVM. Same workaround as pgm-server.yml.
-          curl -fsSL -o /tmp/corretto.rpm "https://corretto.aws/downloads/latest/$CORRETTO_RPM"
-          yum install -y /tmp/corretto.rpm
-          rm -f /tmp/corretto.rpm
+          # Guarded with `command -v java` so re-runs (cloud-init clean, or
+          # idempotent UserData replay) don't fail: `yum install -y <rpm>` for
+          # an already-installed package exits non-zero with "Nothing to do".
+          if ! command -v java >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/corretto.rpm "https://corretto.aws/downloads/latest/$CORRETTO_RPM"
+            yum install -y /tmp/corretto.rpm
+            rm -f /tmp/corretto.rpm
+          fi
 
           yum install -y python3 curl
 
@@ -248,14 +249,23 @@ Resources:
           chown -R minecraft:minecraft /opt/minecraft
 
           # World sync from S3 runs on every boot via a oneshot systemd unit
-          # (mc-pull-world.service) that orders Before=minecraft.service. The
-          # logic:
-          #   - For each dim (world, world_nether, world_the_end), if S3 has any
-          #     objects under <version>/<dim>/, wipe the local dir and sync down.
-          #   - If S3 has no objects for a dim, leave the local dir alone.
-          # This preserves the migration-snapshot path (S3 empty -> data volume
-          # contents preserved) while making S3 authoritative whenever it has
-          # content. server-stop.sh remains the canonical "push to S3" path.
+          # (mc-pull-world.service) that orders Before=minecraft.service. S3 is
+          # the single source of truth for world state:
+          #   - If s3://<bucket>/<version>/world/ has any objects (size > 0),
+          #     wipe local /opt/minecraft/world and sync from S3.
+          #   - Otherwise wipe local world so minecraft regenerates fresh.
+          # server-stop.sh remains the canonical "push to S3" path.
+          #
+          # Vanilla Java Edition layout: nether (DIM-1) and end (DIM1) are
+          # SUBDIRECTORIES of world/, not separate top-level dirs (that's the
+          # Bukkit/Spigot convention). `aws s3 sync world/ ...` carries DIM-1
+          # and DIM1 along automatically — no need for parallel world_nether/
+          # and world_the_end/ prefixes.
+          #
+          # Listing-check pitfall: `aws s3 ls ... | grep -q .` would close
+          # the pipe early, SIGPIPE the aws CLI, and with pipefail the if-test
+          # falsely falls to the else branch on a populated prefix. Use
+          # list-objects-v2 with --query instead.
           cat > /opt/minecraft/pull-world.sh << PULLEOF
           #!/bin/bash
           set -euo pipefail
@@ -271,16 +281,20 @@ Resources:
           if [ -z "\$BUCKET_REGION" ] || [ "\$BUCKET_REGION" = "None" ] || [ "\$BUCKET_REGION" = "null" ]; then
             BUCKET_REGION=us-east-1
           fi
-          for d in world world_nether world_the_end; do
-            if aws --region "\$BUCKET_REGION" s3 ls "s3://\$BUCKET/\$MC_VERSION/\$d/" 2>/dev/null | grep -q .; then
-              echo "pull-world: wiping /opt/minecraft/\$d and syncing from s3://\$BUCKET/\$MC_VERSION/\$d/"
-              rm -rf "/opt/minecraft/\$d"
-              aws --region "\$BUCKET_REGION" s3 sync "s3://\$BUCKET/\$MC_VERSION/\$d/" "/opt/minecraft/\$d/"
-            else
-              echo "pull-world: s3://\$BUCKET/\$MC_VERSION/\$d/ empty — leaving local \$d alone"
-            fi
-          done
-          chown -R minecraft:minecraft /opt/minecraft/world /opt/minecraft/world_nether /opt/minecraft/world_the_end 2>/dev/null || true
+          # Filter Size>0 so the zero-byte folder marker from deploy.sh doesn't
+          # count as "S3 has content".
+          HAS_CONTENT=\$(aws --region "\$BUCKET_REGION" s3api list-objects-v2 \\
+            --bucket "\$BUCKET" --prefix "\$MC_VERSION/world/" \\
+            --query 'Contents[?Size > \`0\`].Key | [0]' --output text 2>/dev/null || echo "")
+          if [ -n "\$HAS_CONTENT" ] && [ "\$HAS_CONTENT" != "None" ]; then
+            echo "pull-world: wiping /opt/minecraft/world and syncing from s3://\$BUCKET/\$MC_VERSION/world/"
+            rm -rf /opt/minecraft/world
+            aws --region "\$BUCKET_REGION" s3 sync "s3://\$BUCKET/\$MC_VERSION/world/" /opt/minecraft/world/
+          else
+            echo "pull-world: s3://\$BUCKET/\$MC_VERSION/world/ empty — wiping local world so minecraft regenerates"
+            rm -rf /opt/minecraft/world
+          fi
+          chown -R minecraft:minecraft /opt/minecraft/world 2>/dev/null || true
           PULLEOF
           chmod +x /opt/minecraft/pull-world.sh
 
@@ -303,6 +317,38 @@ Resources:
           WantedBy=multi-user.target
           PULLSVCEOF
 
+          # Ensure canonical OPs (ocal, L__G) are present in ops.json on every
+          # minecraft start. Merges with any in-game `/op <user>` additions so
+          # admin-added OPs survive restarts. Hook is ExecStartPre on
+          # minecraft.service.
+          cat > /opt/minecraft/apply-ops.py << 'OPSEOF'
+          #!/usr/bin/env python3
+          import json
+          import os
+
+          OPS_FILE = '/opt/minecraft/ops.json'
+          CANONICAL = [
+              {"uuid": "70c5c702-4e70-457b-8d7b-0e22010dc590", "name": "ocal", "level": 4, "bypassesPlayerLimit": False},
+              {"uuid": "f4d3811b-a374-4740-86af-ec4938b91048", "name": "L__G", "level": 4, "bypassesPlayerLimit": False},
+          ]
+
+          existing = []
+          if os.path.exists(OPS_FILE):
+              try:
+                  with open(OPS_FILE) as f:
+                      existing = json.load(f)
+              except Exception:
+                  existing = []
+
+          canonical_uuids = {o['uuid'] for o in CANONICAL}
+          merged = list(CANONICAL) + [o for o in existing if o.get('uuid') not in canonical_uuids]
+
+          with open(OPS_FILE, 'w') as f:
+              json.dump(merged, f, indent=2)
+          OPSEOF
+          chmod 755 /opt/minecraft/apply-ops.py
+          chown minecraft:minecraft /opt/minecraft/apply-ops.py
+
           cat > /etc/systemd/system/minecraft.service << 'SVCEOF'
           [Unit]
           Description=Minecraft Server
@@ -312,6 +358,7 @@ Resources:
           [Service]
           User=minecraft
           WorkingDirectory=/opt/minecraft
+          ExecStartPre=/usr/bin/python3 /opt/minecraft/apply-ops.py
           ExecStart=/usr/bin/java -Xmx${ServerMemoryMB}M -Xms${ServerMemoryMB}M -jar server.jar nogui
           ExecStop=/bin/kill -SIGTERM $MAINPID
           Restart=on-failure

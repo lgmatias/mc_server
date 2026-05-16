@@ -13,16 +13,35 @@
 # into /opt/minecraft/maps/ (additive; does not delete local maps) via SSM,
 # then start the minecraft service.
 #
-# Usage: ./server-start.sh <minecraft-version|pgm> [region]
+# DNS: after the instance is up, this script points the mc.weighted.click A
+# record (Route 53) at the instance's current public IP, so players connect by
+# hostname. The instance gets a fresh ephemeral IP on every start, so the record
+# is refreshed on each launch. Before repointing, it checks whether the record's
+# current IP belongs to a RUNNING instance in any region — if so, another server
+# is live on the hostname and the record is left alone. --no-ip skips the DNS
+# update entirely.
+#
+# Usage: ./server-start.sh <minecraft-version|pgm> [region] [--no-ip]
 #
 # Examples:
 #   ./server-start.sh 1.20.4
 #   ./server-start.sh pgm
+#   ./server-start.sh 1.20.4 us-west-2 --no-ip
 
 set -euo pipefail
 
-TARGET="${1:?Usage: $0 <minecraft-version|pgm> [region]}"
-REGION="${2:-us-east-1}"
+NO_IP=false
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --no-ip) NO_IP=true; shift ;;
+    -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+TARGET="${POSITIONAL[0]:?Usage: $0 <minecraft-version|pgm> [region] [--no-ip]}"
+REGION="${POSITIONAL[1]:-us-east-1}"
 
 if [ "$TARGET" = "pgm" ]; then
   STACK_NAME="pgm"
@@ -135,9 +154,77 @@ PUBLIC_IP=$(aws ec2 describe-instances \
   --query 'Reservations[0].Instances[0].PublicIpAddress' \
   --output text)
 
+# Point the mc.weighted.click A record at this instance's current public IP so
+# players can connect by hostname. The hosted zone is discovered by name, so
+# nothing but the record name is hardcoded.
+#
+#   --no-ip            skip the DNS update entirely.
+#   in-use protection  if the record currently points at an IP held by a
+#                      RUNNING instance in any region, another server is live on
+#                      the hostname — leave the record alone rather than hijack.
+# Non-fatal: a DNS failure warns but does not abort — the server is already up.
+DNS_RECORD="mc.weighted.click"
+DNS_ZONE_NAME="weighted.click"
+DNS_OK=false
+if [ "$NO_IP" = "true" ]; then
+  echo "--no-ip set — leaving the $DNS_RECORD A record unchanged."
+elif [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "None" ]; then
+  echo "Warning: instance has no public IP — skipping DNS update." >&2
+else
+  ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$DNS_ZONE_NAME" \
+    --query "HostedZones[?Name=='${DNS_ZONE_NAME}.'].Id | [0]" --output text 2>/dev/null || echo "")
+  if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "None" ]; then
+    echo "Warning: no Route 53 hosted zone for '$DNS_ZONE_NAME' — skipping DNS update." >&2
+  else
+    CURRENT_IP=$(aws route53 list-resource-record-sets --hosted-zone-id "$ZONE_ID" \
+      --query "ResourceRecordSets[?Name=='${DNS_RECORD}.' && Type=='A'] | [0].ResourceRecords[0].Value" \
+      --output text 2>/dev/null || echo "")
+    # If the record points somewhere other than us, check every region for a
+    # running instance still holding that IP before we overwrite it.
+    DNS_HOLDER=""
+    DNS_HOLDER_REGION=""
+    if [ -n "$CURRENT_IP" ] && [ "$CURRENT_IP" != "None" ] && [ "$CURRENT_IP" != "$PUBLIC_IP" ]; then
+      for SCAN_REGION in $(aws ec2 describe-regions --query 'Regions[*].RegionName' --output text 2>/dev/null || echo ""); do
+        DNS_HOLDER=$(aws ec2 describe-instances --region "$SCAN_REGION" \
+          --filters "Name=ip-address,Values=$CURRENT_IP" "Name=instance-state-name,Values=running" \
+          --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null || echo "")
+        if [ -n "$DNS_HOLDER" ] && [ "$DNS_HOLDER" != "None" ]; then
+          DNS_HOLDER_REGION="$SCAN_REGION"
+          break
+        fi
+        DNS_HOLDER=""
+      done
+    fi
+    if [ -n "$DNS_HOLDER" ]; then
+      echo "Warning: $DNS_RECORD is in use by running instance $DNS_HOLDER" >&2
+      echo "  in $DNS_HOLDER_REGION (IP $CURRENT_IP) — leaving the record unchanged." >&2
+      echo "  Connect to this server directly at $PUBLIC_IP, or stop that instance first." >&2
+    elif [ "$CURRENT_IP" = "$PUBLIC_IP" ]; then
+      echo "$DNS_RECORD already points at this instance ($PUBLIC_IP)."
+      DNS_OK=true
+    else
+      echo "Pointing $DNS_RECORD at $PUBLIC_IP..."
+      CHANGE_BATCH=$(cat <<JSON
+{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"$DNS_RECORD","Type":"A","TTL":60,"ResourceRecords":[{"Value":"$PUBLIC_IP"}]}}]}
+JSON
+)
+      if aws route53 change-resource-record-sets \
+           --hosted-zone-id "$ZONE_ID" --change-batch "$CHANGE_BATCH" \
+           --query 'ChangeInfo.Id' --output text >/dev/null 2>&1; then
+        DNS_OK=true
+      else
+        echo "Warning: DNS update failed (check Route 53 permissions)." >&2
+      fi
+    fi
+  fi
+fi
+
 echo ""
 echo "Instance is up."
 echo "Public IP: $PUBLIC_IP (port 25565)"
+if [ "$DNS_OK" = "true" ]; then
+  echo "Hostname:  $DNS_RECORD"
+fi
 if [ "$IS_PGM" = "false" ]; then
   echo ""
   echo "Vanilla world sync runs on the instance via mc-pull-world.service."

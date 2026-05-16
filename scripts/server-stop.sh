@@ -66,20 +66,17 @@ if [ "$STATE" = "running" ] && [ "$IS_PGM" = "false" ]; then
     REMOTE_SCRIPT=$(cat <<'REMOTE'
 set -euo pipefail
 cd /opt/minecraft
-TARGETS=""
-for d in world world_nether world_the_end; do
-  [ -d "$d" ] && TARGETS="$TARGETS $d"
-done
-if [ -z "$TARGETS" ]; then
-  echo "No world directories on this instance — nothing to save."
+# Vanilla Java Edition uses one world directory; nether (DIM-1) and end (DIM1)
+# are subdirectories under it, NOT separate top-level dirs. `aws s3 sync world/`
+# carries both along.
+if [ ! -d world ]; then
+  echo "No world directory on this instance — nothing to save."
   exit 0
 fi
-echo "Stopping minecraft and syncing:$TARGETS"
+echo "Stopping minecraft and syncing world/ (DIM-1 nether + DIM1 end included)"
 systemctl stop minecraft || true
-for d in $TARGETS; do
-  echo "Syncing $d -> s3://__BUCKET__/__VERSION__/$d/"
-  aws --region __BUCKET_REGION__ s3 sync "$d" "s3://__BUCKET__/__VERSION__/$d/" --delete
-done
+echo "Syncing world -> s3://__BUCKET__/__VERSION__/world/"
+aws --region __BUCKET_REGION__ s3 sync world "s3://__BUCKET__/__VERSION__/world/" --delete
 echo "Save complete."
 REMOTE
 )

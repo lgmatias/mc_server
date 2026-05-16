@@ -31,16 +31,6 @@ Parameters:
     Default: '0.0.0.0/0'
     Description: CIDR block allowed to reach the Minecraft game port (25565).
 
-  SnapshotId:
-    Type: String
-    Default: ''
-    Description: >
-      Optional EBS snapshot ID. If provided, the data volume is initialized from this snapshot
-      (used by deploy-pgm.sh during cross-region migration to carry maps/worlds across regions).
-
-Conditions:
-  HasSnapshot: !Not [!Equals [!Ref SnapshotId, '']]
-
 Resources:
   PgmSG:
     Type: AWS::EC2::SecurityGroup
@@ -102,7 +92,6 @@ Resources:
       AvailabilityZone: !Select [0, !GetAZs '']
       Size: !Ref VolumeSize
       VolumeType: gp3
-      SnapshotId: !If [HasSnapshot, !Ref SnapshotId, !Ref AWS::NoValue]
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-data'
@@ -152,10 +141,15 @@ Resources:
           # corretto.aws because AL2's yum-plugin-priorities silently excludes
           # the Corretto yum repo's packages ("No package ... available" even
           # though the repo file is present).
-          curl -fsSL -o /tmp/corretto.rpm \
-            https://corretto.aws/downloads/latest/amazon-corretto-8-x64-linux-jdk.rpm
-          yum install -y /tmp/corretto.rpm
-          rm -f /tmp/corretto.rpm
+          # Guarded with `command -v java` so re-runs (cloud-init clean, or
+          # idempotent UserData replay) don't fail: `yum install -y <rpm>` for
+          # an already-installed package exits non-zero with "Nothing to do".
+          if ! command -v java >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/corretto.rpm \
+              https://corretto.aws/downloads/latest/amazon-corretto-8-x64-linux-jdk.rpm
+            yum install -y /tmp/corretto.rpm
+            rm -f /tmp/corretto.rpm
+          fi
 
           DEVICE=""
           for i in $(seq 1 60); do
@@ -260,6 +254,39 @@ Resources:
 
           chown -R minecraft:minecraft /opt/minecraft
 
+          # Ensure canonical OPs (ocal, L__G) are present in ops.json on every
+          # minecraft start. Merges with any in-game `/op <user>` additions so
+          # admin-added OPs survive restarts. Hook is ExecStartPre on
+          # minecraft.service. SportPaper inherits Bukkit's vanilla-style ops
+          # handling, so the same ops.json schema works here.
+          cat > /opt/minecraft/apply-ops.py << 'OPSEOF'
+          #!/usr/bin/env python3
+          import json
+          import os
+
+          OPS_FILE = '/opt/minecraft/ops.json'
+          CANONICAL = [
+              {"uuid": "70c5c702-4e70-457b-8d7b-0e22010dc590", "name": "ocal", "level": 4, "bypassesPlayerLimit": False},
+              {"uuid": "f4d3811b-a374-4740-86af-ec4938b91048", "name": "L__G", "level": 4, "bypassesPlayerLimit": False},
+          ]
+
+          existing = []
+          if os.path.exists(OPS_FILE):
+              try:
+                  with open(OPS_FILE) as f:
+                      existing = json.load(f)
+              except Exception:
+                  existing = []
+
+          canonical_uuids = {o['uuid'] for o in CANONICAL}
+          merged = list(CANONICAL) + [o for o in existing if o.get('uuid') not in canonical_uuids]
+
+          with open(OPS_FILE, 'w') as f:
+              json.dump(merged, f, indent=2)
+          OPSEOF
+          chmod 755 /opt/minecraft/apply-ops.py
+          chown minecraft:minecraft /opt/minecraft/apply-ops.py
+
           cat > /etc/systemd/system/minecraft.service << 'SVCEOF'
           [Unit]
           Description=PGM Minecraft Server
@@ -269,6 +296,7 @@ Resources:
           [Service]
           User=minecraft
           WorkingDirectory=/opt/minecraft
+          ExecStartPre=/usr/bin/python3 /opt/minecraft/apply-ops.py
           ExecStart=/opt/minecraft/start.sh
           ExecStop=/bin/kill -SIGTERM $MAINPID
           Restart=on-failure
